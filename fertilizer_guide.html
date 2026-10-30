@@ -1,0 +1,38 @@
+{% extends 'base.html' %}
+{% block title %}Fertilizer Guide · Smart Agri{% endblock %}
+{% block content %}
+<header class="nav container"><a class="brand" href="/"><span>✦</span> smart agri</a><a class="nav-login" href="{{ url_for('dashboard') }}">← Dashboard</a></header>
+<main class="fertilizer-page container">
+  <p class="eyebrow">AUTOMATIC FERTILIZER GUIDE</p>
+  <h1>Select a crop.<br><em>Get your guide.</em></h1>
+  <p class="fertilizer-intro">Choose only your crop to see a baseline fertilizer plan per acre. The guide updates automatically.</p>
+  <div class="fertilizer-grid">
+    <section class="fertilizer-form"><h2>Choose your crop</h2>
+      <label for="crop-select">Crop<select id="crop-select" name="crop">{% for option in crops %}<option value="{{ option }}" {% if crop == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+      <p class="crop-auto-note">✦ Your guide is generated automatically. No soil values or field area are required.</p>
+    </section>
+    <section class="fertilizer-results" aria-live="polite"><p class="eyebrow">BASELINE REQUIREMENT</p><h2 id="plan-title">{{ crop }} fertilizer plan</h2><p class="area-note">Estimated quantity per acre.</p>
+      <div id="fertilizer-plan">{% for item in plan %}<article><span>✦</span><div><strong>{{ item.name }}</strong><small>{{ item.timing }}</small></div><b>{{ item.amount }} kg</b></article>{% endfor %}</div>
+      <p class="safety-note">Important: This is a baseline educational estimate, not a soil-test prescription. Confirm product, dosage, and timing with a local agricultural officer or certified soil laboratory before application.</p>
+    </section>
+  </div>
+</main>
+<script>
+  const cropSelect = document.getElementById('crop-select');
+  const plan = document.getElementById('fertilizer-plan');
+  const title = document.getElementById('plan-title');
+  function planItem(item) { return `<article><span>✦</span><div><strong>${item.name}</strong><small>${item.timing}</small></div><b>${item.amount} kg</b></article>`; }
+  cropSelect.addEventListener('change', async () => {
+    plan.classList.add('loading');
+    try {
+      const response = await fetch(`/api/fertilizer-guide/${encodeURIComponent(cropSelect.value)}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'Could not generate this guide.');
+      title.textContent = `${payload.crop} fertilizer plan`;
+      plan.innerHTML = payload.plan.map(planItem).join('');
+      window.history.replaceState({}, '', `{{ url_for('fertilizer_guide') }}?crop=${encodeURIComponent(payload.crop)}`);
+    } catch (error) { plan.innerHTML = `<p class="guide-error">${error.message}</p>`; }
+    finally { plan.classList.remove('loading'); }
+  });
+</script>
+{% endblock %}

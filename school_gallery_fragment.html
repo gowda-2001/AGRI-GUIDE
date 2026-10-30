@@ -1,0 +1,16 @@
+<section class="school-extra-gallery" id="photo-gallery">
+  <div class="school-extra-inner">
+    <p>School Photo Gallery</p>
+    <h2>Our campus, learning and student life.</h2>
+    <section class="campus-safety">
+      <img src="{{ url_for('static', filename='school-images/safe-campus-gate.jpg') }}" alt="Sri Ranganatha Gramanthara High School entrance and safety signage">
+      <div><b>Safe Campus</b><h3>Welcoming students into a secure learning environment.</h3><p>The school entrance displays child-safety awareness signage, including the Child Helpline 1098. We promote a respectful, safe and caring environment for every student.</p></div>
+    </section>
+    <div class="school-photo-grid">
+      {% for filename, caption in photos %}<figure><img src="{{ url_for('static', filename='school-images/' + filename) }}" alt="{{ caption }}"><figcaption>{{ caption }}</figcaption></figure>{% endfor %}
+    </div>
+  </div>
+</section>
+<style>
+.school-extra-gallery{background:#10262e;padding:86px 8%;color:#fff}.school-extra-inner{max-width:1320px;margin:auto}.school-extra-gallery>div>p{color:#e2bd68;letter-spacing:3px;text-transform:uppercase;font-size:11px;font-weight:bold}.school-extra-gallery h2{font:700 clamp(32px,4vw,54px)/1.1 Georgia,serif;margin:10px 0 35px}.campus-safety{display:grid;grid-template-columns:1.2fr .8fr;background:#f5ead2;color:#17303a;margin-bottom:34px}.campus-safety img{width:100%;height:300px;object-fit:cover}.campus-safety div{padding:40px}.campus-safety b{color:#a77928;font-size:11px;letter-spacing:2px;text-transform:uppercase}.campus-safety h3{font:700 31px/1.15 Georgia,serif;margin:15px 0}.campus-safety p{line-height:1.8;color:#485b5d}.school-photo-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.school-photo-grid figure{margin:0;position:relative;overflow:hidden;min-height:220px;background:#000}.school-photo-grid img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;transition:transform .25s}.school-photo-grid figure:hover img{transform:scale(1.05)}.school-photo-grid figcaption{position:absolute;left:0;right:0;bottom:0;padding:13px;background:#061118d9;color:#fff;font-size:12px}@media(max-width:800px){.school-extra-gallery{padding:60px 5%}.campus-safety{grid-template-columns:1fr}.campus-safety img{height:220px}.campus-safety div{padding:27px}.campus-safety h3{font-size:26px}.school-photo-grid{grid-template-columns:repeat(2,1fr);gap:9px}.school-photo-grid figure{min-height:155px}}
+</style>

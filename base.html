@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Smart Agri{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='marketplace.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='advisor.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='weather.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='fertilizer.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='schemes.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='school.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='tracking.css') }}">
+</head>
+<body>
+  {% block content %}{% endblock %}
+</body>
+</html>

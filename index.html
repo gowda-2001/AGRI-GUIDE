@@ -1,0 +1,34 @@
+{% extends 'base.html' %}
+{% block title %}Agri Guide | Farmer Support & Marketplace{% endblock %}
+{% block content %}
+<header class="nav container">
+  <a class="brand" href="/"><span>✦</span> smart agri</a>
+  <nav><a href="#concept">Our concept</a><a href="#how">How it works</a><a href="#team">Our team</a></nav>
+  <a class="nav-login" href="#join">Join us <span>→</span></a>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-copy container">
+      <p class="eyebrow">GROWN WITH CARE · DELIVERED WITH TRUST</p>
+      <h1>AGRI GUIDE INTEGRATED WEB APPLICATION<br><em>FOR FARMERS SUPPORT AND MARKETING PLACES.</em></h1>
+      <p class="hero-text">A simple, fair marketplace where farmers share their harvest and families discover food with a real story behind it.</p>
+      <div class="hero-actions"><a class="btn btn-dark" href="#join">Get started <span>→</span></a><a class="text-link" href="#how">See how it works <span>↘</span></a></div>
+      <div class="hero-note"><span class="leaf">⌁</span><span><strong>No middlemen.</strong> Just good food and good people.</span></div>
+    </div>
+    <div class="sun"></div><div class="hill hill-one"></div><div class="hill hill-two"></div><div class="field-lines"></div><div class="plant plant-one">🌾</div><div class="plant plant-two">🌿</div>
+  </section>
+
+  <section id="concept" class="concept container">
+    <div><p class="eyebrow">WHY SMART AGRI</p><h2>Food should travel<br>with <em>less distance</em><br>and more meaning.</h2></div>
+    <div class="concept-copy"><p>We bring the people who grow our food closer to the people who enjoy it. Farmers receive a fair price; consumers receive fresher, more transparent produce.</p><a class="text-link" href="#join">Be part of the change <span>→</span></a></div>
+  </section>
+
+  <section id="how" class="how"><div class="container"><p class="eyebrow centered">A BETTER WAY TO BUY &amp; SELL</p><h2 class="centered">Simple by design.</h2><div class="steps"><article><span class="step-number">01</span><div class="step-icon">🌱</div><h3>Farmers list harvests</h3><p>Add your fresh produce, set your own fair price, and tell your farm’s story.</p></article><article><span class="step-number">02</span><div class="step-icon">🧺</div><h3>Neighbours discover</h3><p>Browse local, seasonal food and buy directly from the people who grew it.</p></article><article><span class="step-number">03</span><div class="step-icon">💚</div><h3>Everyone grows stronger</h3><p>More value stays with farmers, and better food reaches every home.</p></article></div></div></section>
+
+  <section id="join" class="join container"><div class="join-art"><span>✿</span><span>🍊</span><span>🥕</span></div><div><p class="eyebrow">YOUR SEAT AT THE TABLE</p><h2>Let’s grow<br>something good.</h2></div><div class="join-options"><div><h3>I’m a farmer</h3><p>Share your harvest. Reach people who value your work.</p><a href="{{ url_for('register', role='farmer') }}" class="btn btn-light">Join as farmer <span>→</span></a><a class="small-link" href="{{ url_for('login', role='farmer') }}">Already a member? Log in</a></div><div><h3>I’m a consumer</h3><p>Find honest food from farms in and around your community.</p><a href="{{ url_for('register', role='consumer') }}" class="btn btn-light">Join as consumer <span>→</span></a><a class="small-link" href="{{ url_for('login', role='consumer') }}">Already a member? Log in</a></div></div></section>
+
+  <section id="team" class="team container"><p class="eyebrow centered">THE PEOPLE BEHIND THE SEEDS</p><h2 class="centered">Meet our team.</h2><div class="team-grid"><article><div class="avatar a1">A</div><h3>Ananya Shah</h3><p>Community &amp; farmers</p></article><article><div class="avatar a2">R</div><h3>Rahul Menon</h3><p>Product &amp; technology</p></article><article><div class="avatar a3">S</div><h3>Sana Iqbal</h3><p>Operations &amp; impact</p></article></div></section>
+</main>
+<footer><div class="container footer-inner"><a class="brand" href="/"><span>✦</span> smart agri</a><p>Good food begins with a good connection.</p><p>© 2026 Smart Agri</p></div></footer>
+{% endblock %}

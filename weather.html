@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+{% block title %}District Weather · Smart Agri{% endblock %}
+{% block content %}
+<header class="nav container"><a class="brand" href="/"><span>✦</span> smart agri</a><a class="nav-login" href="{{ url_for('dashboard') }}">← Dashboard</a></header>
+<main class="weather-page container">
+  <p class="eyebrow">LIVE KARNATAKA FARM WEATHER</p>
+  <h1>Every district.<br><em>One clear forecast.</em></h1>
+  <div class="weather-toolbar">
+    <p id="weather-status">{% if updated_at %}Updated {{ updated_at.strftime('%d %b %Y, %I:%M %p') }}{% else %}Loading live district weather…{% endif %}</p>
+    <button class="btn btn-dark" type="button" id="refresh-weather">Refresh now ↻</button>
+  </div>
+  {% if error %}<div class="weather-error" id="weather-error"><strong>Weather unavailable</strong><p>{{ error }}</p></div>{% else %}<div class="weather-error" id="weather-error" hidden></div>{% endif %}
+  <section class="district-weather-grid" id="district-weather-grid" aria-live="polite">
+    {% for district in districts %}
+    <article class="district-weather-card">
+      <div><p>{{ district.district }}</p><strong>{{ district.temperature }}°C</strong><span>Feels like {{ district.feels_like }}°C</span></div>
+      <img src="https://openweathermap.org/img/wn/{{ district.icon }}@2x.png" alt="{{ district.condition }}">
+      <footer><span>{{ district.condition }}</span><span>💧 {{ district.humidity }}% · 🌧 {{ district.rain }} mm</span></footer>
+    </article>
+    {% endfor %}
+  </section>
+  <p class="weather-tip">Weather refreshes automatically every 10 minutes. Use rainfall, wind, and humidity before planning irrigation or spraying.</p>
+</main>
+<script>
+  const grid = document.getElementById('district-weather-grid');
+  const status = document.getElementById('weather-status');
+  const errorBox = document.getElementById('weather-error');
+  const refreshButton = document.getElementById('refresh-weather');
+  function weatherCard(d) {
+    return `<article class="district-weather-card"><div><p>${d.district}</p><strong>${d.temperature}°C</strong><span>Feels like ${d.feels_like}°C</span></div><img src="https://openweathermap.org/img/wn/${d.icon}@2x.png" alt="${d.condition}"><footer><span>${d.condition}</span><span>💧 ${d.humidity}% · 🌧 ${d.rain} mm</span></footer></article>`;
+  }
+  async function refreshWeather() {
+    refreshButton.disabled = true; refreshButton.textContent = 'Updating…';
+    try {
+      const response = await fetch('{{ url_for("district_weather_api") }}');
+      const payload = await response.json();
+      if (!response.ok || payload.error) throw new Error(payload.error || 'Could not refresh weather.');
+      grid.innerHTML = payload.districts.map(weatherCard).join('');
+      status.textContent = `Updated ${payload.updated_at}`;
+      errorBox.hidden = true;
+    } catch (error) {
+      errorBox.innerHTML = `<strong>Weather unavailable</strong><p>${error.message}</p>`;
+      errorBox.hidden = false;
+    } finally {
+      refreshButton.disabled = false; refreshButton.textContent = 'Refresh now ↻';
+    }
+  }
+  refreshButton.addEventListener('click', refreshWeather);
+  window.setInterval(refreshWeather, 600000);
+</script>
+{% endblock %}

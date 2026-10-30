@@ -1,0 +1,53 @@
+{% extends 'base.html' %}
+{% block title %}Dashboard · Smart Agri{% endblock %}
+{% block content %}
+<header class="nav container"><a class="brand" href="/"><span>✦</span> smart agri</a><nav><a href="#market">Marketplace</a><a href="{{ url_for('weather') }}">Weather</a>{% if user.role == 'farmer' %}<a href="{{ url_for('farmer_deliveries') }}">Delivery locations</a><a href="{{ url_for('crop_recommendation') }}">AI crop advisor</a><a href="{{ url_for('fertilizer_guide') }}">Fertilizer guide</a><a href="{{ url_for('government_schemes') }}">Govt schemes</a><a href="#borewells">Borewell points</a>{% endif %}</nav>{% if user.role == 'consumer' %}<a class="cart-link" href="{{ url_for('checkout') }}">Basket ({{ cart_count }})</a>{% endif %}<a class="nav-login" href="{{ url_for('logout') }}">Log out →</a></header>
+<main class="dashboard container"><p class="eyebrow">{{ user.role|upper }} DASHBOARD</p><h1>Hello, <em>{{ user.name.split()[0] }}.</em></h1><p class="dash-lead">{% if user.role == 'farmer' %}Add your harvest with the price and a photo. Consumers can buy it directly from you.{% else %}Discover fresh, local produce directly from farmers.{% endif %}</p>
+{% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
+{% if user.role == 'farmer' %}<section class="add-product"><h2>Add a harvest</h2><form method="post" action="{{ url_for('add_product') }}" enctype="multipart/form-data" class="product-form"><label>Product name<input name="name" required placeholder="Fresh carrots"></label><label>Price (₹)<input name="price" type="number" min="1" step="0.01" required placeholder="50"></label><label>Unit<input name="unit" required placeholder="kg, bunch, box..."></label><label>Product photo<input name="image" type="file" accept=".jpg,.jpeg,.png,.webp"></label><button class="btn btn-dark" type="submit">Publish product →</button></form></section>{% else %}<section class="dashboard-panel"><div><h2>Today’s fresh picks</h2><p>Direct from local farms, with no middlemen.</p></div><a class="btn btn-dark" href="{{ url_for('checkout') }}">Go to basket →</a></section>{% endif %}
+<div id="market" class="product-grid">{% for product in products %}<article class="product-card"><div class="product-image">{% if product.image %}<img src="{{ url_for('static', filename='uploads/' + product.image) }}" alt="{{ product.name }}">{% else %}{{ product.emoji }}{% endif %}</div><p>{{ product.farm }}</p><h3>{{ product.name }}</h3><div><strong>₹{{ '%.2f'|format(product.price) }} / {{ product.unit }}</strong>{% if user.role == 'consumer' %}<form method="post" action="{{ url_for('add_to_cart', product_id=product.id) }}"><button class="round-btn" title="Add to basket">+</button></form>{% endif %}</div></article>{% else %}<p>No products listed yet. Add your first harvest above.</p>{% endfor %}</div></main>
+{% if user.role == 'farmer' %}
+<section id="borewells" class="borewell-section container">
+  <div class="borewell-copy"><p class="eyebrow">AUTOMATIC FARM WATER POINT</p><h2>Your current <em>borewell</em><br>location.</h2><p>The map automatically uses your device GPS to show the borewell point. Allow location permission while you are standing at the borewell for the most accurate result.</p><div class="borewell-actions"><button class="btn btn-dark" type="button" id="refresh-location">Refresh location</button></div><p class="borewell-help">The marker uses GPS. It cannot detect an underground borewell unless the device is at that location.</p></div>
+  <div class="borewell-map-wrap"><div id="borewell-map" aria-label="Automatic borewell location map"></div><p class="map-status" id="map-status">Finding your current location…</p></div>
+</section>
+<section class="equipment-planner container">
+  <div><p class="eyebrow">BOREWELL EQUIPMENT PLANNER</p><h2>Pipe, cable &amp; motor guide.</h2><p>Enter the measurements from your drilling or pump report. The calculator estimates the material lengths and an initial motor/cable range.</p></div>
+  <form id="equipment-form" class="equipment-form">
+    <label>Borewell total depth (ft)<input id="bore-depth" type="number" min="30" required placeholder="e.g. 300"></label>
+    <label>Pumping water level (ft)<input id="water-level" type="number" min="10" required placeholder="e.g. 180"></label>
+    <label>Panel to borewell distance (ft)<input id="panel-distance" type="number" min="0" required placeholder="e.g. 40"></label>
+    <label>Tank / delivery lift (ft)<input id="delivery-lift" type="number" min="0" required placeholder="e.g. 25"></label>
+    <label>Required water flow (L/min)<input id="flow-rate" type="number" min="1" required placeholder="e.g. 80"></label>
+    <label>Electric supply<select id="power-phase"><option value="single">Single phase</option><option value="three">Three phase</option></select></label>
+    <button class="btn btn-dark" type="submit">Calculate equipment</button>
+  </form>
+  <div class="equipment-results" id="equipment-results" aria-live="polite"><p>Enter measured borewell details to see the equipment plan.</p></div>
+</section>
+<link rel="stylesheet" href="{{ url_for('static', filename='borewell.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='equipment.css') }}"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+  const borewellMap = L.map('borewell-map').setView([15.3173, 75.7139], 7);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(borewellMap);
+  const status = document.getElementById('map-status'); let borewellMarker;
+  function showAutomaticPoint(position) { const point = [position.coords.latitude, position.coords.longitude]; if (borewellMarker) borewellMap.removeLayer(borewellMarker); borewellMarker = L.marker(point).addTo(borewellMap).bindPopup('<strong>Current borewell location</strong><br>GPS point').openPopup(); borewellMap.setView(point, 18); status.textContent = `Automatic GPS location found (accuracy: approximately ${Math.round(position.coords.accuracy)} metres).`; }
+  function findBorewellLocation() { if (!navigator.geolocation) { status.textContent = 'Location is not supported by this browser.'; return; } status.textContent = 'Finding your current GPS location…'; navigator.geolocation.getCurrentPosition(showAutomaticPoint, () => { status.textContent = 'Allow browser location permission to show the automatic borewell point.'; }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }); }
+  document.getElementById('refresh-location').addEventListener('click', findBorewellLocation); findBorewellLocation();
+  document.getElementById('equipment-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const depth = Number(document.getElementById('bore-depth').value), waterLevel = Number(document.getElementById('water-level').value), panelDistance = Number(document.getElementById('panel-distance').value), lift = Number(document.getElementById('delivery-lift').value), flow = Number(document.getElementById('flow-rate').value), phase = document.getElementById('power-phase').value;
+    const results = document.getElementById('equipment-results');
+    if (waterLevel >= depth) { results.innerHTML = '<p class="equipment-error">Pumping water level must be less than the total borewell depth.</p>'; return; }
+    const pumpDepth = Math.min(depth - 15, waterLevel + 30);
+    const pipeLength = Math.ceil(pumpDepth * 1.1 / 10) * 10;
+    const cableLength = Math.ceil((pumpDepth + panelDistance + 15) * 1.1 / 10) * 10;
+    const totalHead = Math.round(pumpDepth + lift + (pipeLength * 0.04));
+    let motor = '1 HP', cable = '2.5 sq mm flat copper submersible cable';
+    if (totalHead > 160 || flow > 70) { motor = '1.5–2 HP'; cable = '4 sq mm flat copper submersible cable'; }
+    if (totalHead > 280 || flow > 120) { motor = '2–3 HP'; cable = '6 sq mm flat copper submersible cable'; }
+    if (totalHead > 450 || flow > 180) { motor = '3–5 HP — select from a manufacturer pump curve'; cable = 'Cable size must be verified for voltage drop by a licensed electrician'; }
+    const phaseNote = phase === 'single' ? 'Use a single-phase rated submersible motor with the correct starter/control box.' : 'Use a three-phase rated submersible motor with starter, overload and dry-run protection.';
+    results.innerHTML = `<article><strong>${pipeLength} ft</strong><span>Estimated HDPE/GI rising pipe length</span></article><article><strong>${cableLength} ft</strong><span>Estimated submersible cable length (includes 10% spare)</span></article><article><strong>${motor}</strong><span>Initial motor range for about ${totalHead} ft total head</span></article><article><strong>${cable}</strong><span>Initial cable guidance; confirm against the selected motor’s chart</span></article><p class="equipment-note">${phaseNote} Install a non-return valve, safety rope, dry-run protection, earthing, and waterproof cable joint. Final pump selection must use the manufacturer’s pump curve for actual discharge and head.</p>`;
+  });
+</script>
+{% endif %}
+{% endblock %}
