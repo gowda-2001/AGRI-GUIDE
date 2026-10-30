@@ -1,526 +1,1536 @@
-import sqlite3
-import json
+from __future__ import annotations
+
+import collections.abc as cabc
 import os
-import secrets
-import time
+import sys
+import typing as t
+import weakref
 from datetime import timedelta
-from threading import Lock
+from inspect import iscoroutinefunction
+from itertools import chain
+from types import TracebackType
+from urllib.parse import quote as _url_quote
+
 import click
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+from werkzeug.datastructures import Headers
+from werkzeug.datastructures import ImmutableDict
+from werkzeug.exceptions import BadRequestKeyError
+from werkzeug.exceptions import HTTPException
+from werkzeug.exceptions import InternalServerError
+from werkzeug.routing import BuildError
+from werkzeug.routing import MapAdapter
+from werkzeug.routing import RequestRedirect
+from werkzeug.routing import RoutingException
+from werkzeug.routing import Rule
+from werkzeug.serving import is_running_from_reloader
+from werkzeug.wrappers import Response as BaseResponse
+from werkzeug.wsgi import get_host
 
-from flask import Flask, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
-from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix
+from . import cli
+from . import typing as ft
+from .ctx import AppContext
+from .ctx import RequestContext
+from .globals import _cv_app
+from .globals import _cv_request
+from .globals import current_app
+from .globals import g
+from .globals import request
+from .globals import request_ctx
+from .globals import session
+from .helpers import get_debug_flag
+from .helpers import get_flashed_messages
+from .helpers import get_load_dotenv
+from .helpers import send_from_directory
+from .sansio.app import App
+from .sansio.scaffold import _sentinel
+from .sessions import SecureCookieSessionInterface
+from .sessions import SessionInterface
+from .signals import appcontext_tearing_down
+from .signals import got_request_exception
+from .signals import request_finished
+from .signals import request_started
+from .signals import request_tearing_down
+from .templating import Environment
+from .wrappers import Request
+from .wrappers import Response
 
-def load_local_env():
-    """Load local key=value settings without adding another dependency."""
-    env_file = Path(__file__).with_name(".env")
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip())
+if t.TYPE_CHECKING:  # pragma: no cover
+    from _typeshed.wsgi import StartResponse
+    from _typeshed.wsgi import WSGIEnvironment
 
-load_local_env()
-app = Flask(__name__)
-is_production = os.environ.get("FLASK_ENV") == "production"
-configured_secret = os.environ.get("SECRET_KEY")
-if is_production and not configured_secret:
-    raise RuntimeError("SECRET_KEY must be set in production.")
-app.config.update(
-    SECRET_KEY=configured_secret or secrets.token_hex(32),
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=is_production,
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
-    SESSION_REFRESH_EACH_REQUEST=True,
-    MAX_CONTENT_LENGTH=5 * 1024 * 1024,
+    from .testing import FlaskClient
+    from .testing import FlaskCliRunner
+    from .typing import HeadersValue
+
+T_shell_context_processor = t.TypeVar(
+    "T_shell_context_processor", bound=ft.ShellContextProcessorCallable
 )
-if is_production:
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-app.config["OPENWEATHER_API_KEY"] = os.environ.get("OPENWEATHER_API_KEY", "")
-app.config["DATABASE"] = Path(os.environ.get("DATABASE_PATH", Path(app.root_path) / "smart_agri.db"))
-app.config["UPLOAD_FOLDER"] = Path(app.static_folder) / "uploads"
-app.config["DATABASE"].parent.mkdir(parents=True, exist_ok=True)
-app.config["UPLOAD_FOLDER"].mkdir(exist_ok=True)
+T_teardown = t.TypeVar("T_teardown", bound=ft.TeardownCallable)
+T_template_filter = t.TypeVar("T_template_filter", bound=ft.TemplateFilterCallable)
+T_template_global = t.TypeVar("T_template_global", bound=ft.TemplateGlobalCallable)
+T_template_test = t.TypeVar("T_template_test", bound=ft.TemplateTestCallable)
 
-# District headquarters covered by the Karnataka farmer dashboard.  Keeping this
-# list here makes it simple to extend when the application is rolled out elsewhere.
-KARNATAKA_DISTRICTS = (
-    "Bagalkote", "Ballari", "Belagavi", "Bengaluru Rural", "Bengaluru Urban",
-    "Bidar", "Chamarajanagar", "Chikkaballapur", "Chikkamagaluru", "Chitradurga",
-    "Dakshina Kannada", "Davanagere", "Dharwad", "Gadag", "Hassan", "Haveri",
-    "Kalaburagi", "Kodagu", "Kolar", "Koppal", "Mandya", "Mysuru", "Raichur",
-    "Ramanagara", "Shivamogga", "Tumakuru", "Udupi", "Uttara Kannada",
-    "Vijayapura", "Vijayanagara", "Yadgir",
-)
-WEATHER_CACHE_SECONDS = 600
-MINIMUM_ORDER_AMOUNT = 99.0
-weather_cache = {"data": [], "updated_at": None, "error": None}
-login_attempts = {}
-login_attempts_lock = Lock()
 
-def password_is_safe(password):
-    return (len(password) >= 12 and any(char.islower() for char in password)
-            and any(char.isupper() for char in password) and any(char.isdigit() for char in password))
+def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
+    if value is None or isinstance(value, timedelta):
+        return value
 
-def login_is_rate_limited(email):
-    """Allow at most five attempts per account/IP in 15 minutes."""
-    now, key = time.monotonic(), f"{request.remote_addr}:{email}"
-    with login_attempts_lock:
-        attempts = [stamp for stamp in login_attempts.get(key, []) if now - stamp < 900]
-        if len(attempts) >= 5:
-            login_attempts[key] = attempts
-            return True
-        attempts.append(now)
-        login_attempts[key] = attempts
-    return False
+    return timedelta(seconds=value)
 
-@app.context_processor
-def security_context():
-    if "csrf_token" not in session:
-        session["csrf_token"] = secrets.token_urlsafe(32)
-    return {"csrf_token": session["csrf_token"], "minimum_order_amount": MINIMUM_ORDER_AMOUNT}
 
-@app.before_request
-def verify_csrf_token():
-    if is_production and not request.is_secure:
-        return redirect(request.url.replace("http://", "https://", 1), code=301)
-    if request.method == "POST":
-        origin = request.headers.get("Origin")
-        if origin and origin != request.host_url.rstrip("/"):
-            flash("For your protection, that request was blocked.", "error")
-            return redirect(request.referrer or url_for("index"))
-        if request.endpoint == "checkout":
-            expected, supplied = session.get("csrf_token", ""), request.form.get("csrf_token", "")
-            if not expected or not secrets.compare_digest(expected, supplied):
-                flash("Your form session expired. Please try again.", "error")
-                return redirect(url_for("checkout"))
+class Flask(App):
+    """The flask object implements a WSGI application and acts as the central
+    object.  It is passed the name of the module or package of the
+    application.  Once it is created it will act as a central registry for
+    the view functions, the URL rules, template configuration and much more.
 
-@app.after_request
-def set_security_headers(response):
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), payment=(), usb=()"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data: https://*.tile.openstreetmap.org; connect-src 'self'"
-    if is_production:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return response
+    The name of the package is used to resolve resources from inside the
+    package or the folder the module is contained in depending on if the
+    package parameter resolves to an actual python package (a folder with
+    an :file:`__init__.py` file inside) or a standard module (just a ``.py`` file).
 
-def fetch_district_weather(district, api_key):
-    """Fetch one district headquarters' current weather from OpenWeather."""
-    url = "https://api.openweathermap.org/data/2.5/weather?" + urlencode({
-        "q": f"{district},IN", "appid": api_key, "units": "metric"
-    })
-    with urlopen(url, timeout=8) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    return {
-        "district": district,
-        "temperature": round(data["main"]["temp"]),
-        "feels_like": round(data["main"]["feels_like"]),
-        "condition": data["weather"][0]["description"].title(),
-        "icon": data["weather"][0]["icon"],
-        "humidity": data["main"]["humidity"],
-        "wind": data["wind"]["speed"],
-        "rain": data.get("rain", {}).get("1h", 0),
-    }
+    For more information about resource loading, see :func:`open_resource`.
 
-def get_district_weather():
-    """Return cached live weather and refresh it at most once every 10 minutes."""
-    now = datetime.now()
-    cached_at = weather_cache["updated_at"]
-    if cached_at and (now - cached_at).total_seconds() < WEATHER_CACHE_SECONDS:
-        return weather_cache["data"], weather_cache["error"], cached_at
+    Usually you create a :class:`Flask` instance in your main module or
+    in the :file:`__init__.py` file of your package like this::
 
-    api_key = app.config["OPENWEATHER_API_KEY"]
-    if not api_key:
-        return [], "Add an OpenWeather API key to enable live district weather.", cached_at
+        from flask import Flask
+        app = Flask(__name__)
 
-    results = []
-    try:
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(fetch_district_weather, district, api_key): district for district in KARNATAKA_DISTRICTS}
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except (HTTPError, URLError, TimeoutError, KeyError, json.JSONDecodeError):
-                    # A single unavailable district should not stop the whole dashboard.
-                    continue
-        if not results:
-            raise URLError("No district weather responses")
-        results.sort(key=lambda item: KARNATAKA_DISTRICTS.index(item["district"]))
-        weather_cache.update({"data": results, "updated_at": now, "error": None})
-    except HTTPError as exc:
-        message = "OpenWeather rejected the API key. Check the key in .env and restart the server." if exc.code == 401 else "Weather service is currently unavailable."
-        weather_cache["error"] = message
-    except (URLError, TimeoutError):
-        weather_cache["error"] = "Could not retrieve district weather. Check the internet connection and try again."
-    return weather_cache["data"], weather_cache["error"], weather_cache["updated_at"]
+    .. admonition:: About the First Parameter
 
-def db():
-    if "db" not in g:
-        g.db = sqlite3.connect(app.config["DATABASE"])
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
-    return g.db
+        The idea of the first parameter is to give Flask an idea of what
+        belongs to your application.  This name is used to find resources
+        on the filesystem, can be used by extensions to improve debugging
+        information and a lot more.
 
-@app.teardown_appcontext
-def close_db(_error=None):
-    connection = g.pop("db", None)
-    if connection: connection.close()
+        So it's important what you provide there.  If you are using a single
+        module, `__name__` is always the correct value.  If you however are
+        using a package, it's usually recommended to hardcode the name of
+        your package there.
 
-def init_db():
-    database = db()
-    database.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('farmer','consumer','admin')),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, price REAL NOT NULL CHECK(price > 0),
-            unit TEXT NOT NULL, image TEXT, emoji TEXT DEFAULT '🌿', farmer_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(farmer_id) REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS cart_items (
-            consumer_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity > 0),
-            PRIMARY KEY(consumer_id, product_id), FOREIGN KEY(consumer_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, consumer_id INTEGER NOT NULL, address TEXT NOT NULL,
-            payment_method TEXT NOT NULL, total REAL NOT NULL, created_at TEXT NOT NULL,
-            FOREIGN KEY(consumer_id) REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS order_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, product_name TEXT NOT NULL,
-            farm_name TEXT NOT NULL, price REAL NOT NULL, unit TEXT NOT NULL, quantity INTEGER NOT NULL, subtotal REAL NOT NULL,
-            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
-        );
-    """)
-    order_columns = {row[1] for row in database.execute("PRAGMA table_info(orders)").fetchall()}
-    if "latitude" not in order_columns:
-        database.execute("ALTER TABLE orders ADD COLUMN latitude REAL")
-        database.execute("ALTER TABLE orders ADD COLUMN longitude REAL")
-        database.execute("ALTER TABLE orders ADD COLUMN location_accuracy REAL")
-    item_columns = {row[1] for row in database.execute("PRAGMA table_info(order_items)").fetchall()}
-    if "farmer_id" not in item_columns:
-        database.execute("ALTER TABLE order_items ADD COLUMN farmer_id INTEGER")
-    schema = database.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()[0]
-    if "'admin'" not in schema:
-        database.execute("PRAGMA foreign_keys = OFF")
-        database.executescript("""
-            CREATE TABLE users_new (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('farmer','consumer','admin')),
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-            INSERT INTO users_new (id, name, email, password_hash, role, created_at)
-                SELECT id, name, email, password_hash, role, created_at FROM users;
-            DROP TABLE users;
-            ALTER TABLE users_new RENAME TO users;
-        """)
-        database.execute("PRAGMA foreign_keys = ON")
-    if database.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-        database.executemany("INSERT INTO products (name, price, unit, emoji, farmer_id) VALUES (?, ?, ?, ?, NULL)", [
-            ("Organic Tomatoes", 45, "kg", "🍅"), ("Fresh Alphonso Mangoes", 180, "kg", "🥭"), ("Farm Fresh Spinach", 35, "bunch", "🥬")])
-    database.commit()
+        For example if your application is defined in :file:`yourapplication/app.py`
+        you should create it with one of the two versions below::
 
-def current_user():
-    if not session.get("user_id"): return None
-    row = db().execute("SELECT id, name, email, role FROM users WHERE id = ?", (session["user_id"],)).fetchone()
-    return dict(row) if row else None
+            app = Flask('yourapplication')
+            app = Flask(__name__.split('.')[0])
 
-def product_rows(farmer_id=None):
-    query = """SELECT p.id, p.name, p.price, p.unit, p.image, p.emoji, p.farmer_id,
-               COALESCE(u.name, 'Smart Agri Partner Farm') AS farm
-               FROM products p LEFT JOIN users u ON p.farmer_id = u.id"""
-    params = ()
-    if farmer_id:
-        query += " WHERE p.farmer_id = ?"; params = (farmer_id,)
-    return [dict(row) for row in db().execute(query + " ORDER BY p.id DESC", params).fetchall()]
+        Why is that?  The application will work even with `__name__`, thanks
+        to how resources are looked up.  However it will make debugging more
+        painful.  Certain extensions can make assumptions based on the
+        import name of your application.  For example the Flask-SQLAlchemy
+        extension will look for the code in your application that triggered
+        an SQL query in debug mode.  If the import name is not properly set
+        up, that debugging information is lost.  (For example it would only
+        pick up SQL queries in `yourapplication.app` and not
+        `yourapplication.views.frontend`)
 
-@app.route("/weather")
-def weather():
-    user = current_user()
-    if not user: return redirect(url_for("index"))
-    districts, error, updated_at = get_district_weather()
-    return render_template("weather.html", districts=districts, error=error, updated_at=updated_at)
+    .. versionadded:: 0.7
+       The `static_url_path`, `static_folder`, and `template_folder`
+       parameters were added.
 
-@app.route("/api/weather/districts")
-def district_weather_api():
-    user = current_user()
-    if not user:
-        return jsonify({"error": "Sign in to view weather."}), 401
-    districts, error, updated_at = get_district_weather()
-    return jsonify({
-        "districts": districts,
-        "error": error,
-        "updated_at": updated_at.strftime("%d %b %Y, %I:%M %p") if updated_at else None,
-    })
+    .. versionadded:: 0.8
+       The `instance_path` and `instance_relative_config` parameters were
+       added.
 
-@app.route("/")
-def index(): return render_template("school.html" if os.environ.get("SITE_MODE") == "school" else "index.html")
+    .. versionadded:: 0.11
+       The `root_path` parameter was added.
 
-@app.route("/school")
-def school():
-    photos = [
-        ("president-new.webp", "Dr. Sri Sri Sri Shivakumara Swamiji"),
-        ("siddalinga-new.jpeg", "Sree Sree Siddalinga Swamiji"),
-        ("shivasiddeshwara-new.jpg", "Sree Shivasiddeshwara Swamiji"),
-        ("secretary.jpg", "Sri T. K. Nanjundappa"),
-        ("students-achievement.jpg", "Student achievement programme"),
-        ("teaching-classroom.jpg", "Classroom learning"),
-        ("playground.jpg", "School playground"),
-        ("yoga-standing.jpg", "Yoga and wellbeing programme"),
-        ("school-assembly.jpg", "School assembly"),
-        ("school-programme.jpg", "School programme"),
-        ("sports-equipment.jpg", "Sports equipment"),
-        ("campus-front.jpg", "School campus"),
-        ("yoga-group.jpg", "Student yoga session"),
-        ("learning-board.jpg", "Learning board"),
-        ("yoga-rest.jpg", "Student yoga activity"),
-    ]
-    page = render_template("school.html")
-    gallery = render_template("school_gallery_fragment.html", photos=photos)
-    return page.replace("</main>", gallery + "</main>")
+    .. versionadded:: 1.0
+       The ``host_matching`` and ``static_host`` parameters were added.
 
-@app.route("/register/<role>", methods=["GET", "POST"])
-def register(role):
-    if role not in {"farmer", "consumer"}: return redirect(url_for("index"))
-    if request.method == "POST":
-        name, email, password = request.form["name"].strip(), request.form["email"].lower().strip(), request.form["password"]
-        if not name or not email or not password: flash("Please complete every field.", "error")
-        elif len(name) > 100 or len(email) > 254 or not password_is_safe(password):
-            flash("Use a 12+ character password with uppercase, lowercase, and a number.", "error")
-        else:
-            try:
-                cursor = db().execute("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)", (name, email, generate_password_hash(password), role))
-                db().commit(); session["user_id"] = cursor.lastrowid
-                return redirect(url_for("dashboard"))
-            except sqlite3.IntegrityError: flash("An account with this email already exists.", "error")
-    return render_template("auth.html", mode="Register", role=role)
+    .. versionadded:: 1.0
+       The ``subdomain_matching`` parameter was added. Subdomain
+       matching needs to be enabled manually now. Setting
+       :data:`SERVER_NAME` does not implicitly enable it.
 
-@app.route("/login/<role>", methods=["GET", "POST"])
-def login(role):
-    if role not in {"farmer", "consumer", "admin"}: return redirect(url_for("index"))
-    if request.method == "POST":
-        email = request.form["email"].lower().strip()
-        if login_is_rate_limited(email):
-            flash("Too many sign-in attempts. Please wait 15 minutes and try again.", "error")
-            return render_template("auth.html", mode="Login", role=role)
-        user = db().execute("SELECT * FROM users WHERE email = ? AND role = ?", (email, role)).fetchone()
-        if user and check_password_hash(user["password_hash"], request.form["password"]):
-            session.clear()
-            session["user_id"] = user["id"]
-            session.permanent = True
-            return redirect(url_for("dashboard"))
-        flash(f"We couldn't find a matching {role} account.", "error")
-    return render_template("auth.html", mode="Login", role=role)
-
-@app.route("/dashboard")
-def dashboard():
-    user = current_user()
-    if not user: return redirect(url_for("login", role="consumer"))
-    # Administrators see their protected platform dashboard at /dashboard too.
-    if user["role"] == "admin": return admin_dashboard()
-    products = product_rows(user["id"] if user["role"] == "farmer" else None)
-    count = db().execute("SELECT COALESCE(SUM(quantity), 0) FROM cart_items WHERE consumer_id = ?", (user["id"],)).fetchone()[0]
-    return render_template("dashboard.html", user=user, products=products, cart_count=count)
-
-@app.route("/farmer/deliveries")
-def farmer_deliveries():
-    user = current_user()
-    if not user or user["role"] != "farmer": return redirect(url_for("login", role="farmer"))
-    orders = [dict(row) for row in db().execute("""SELECT DISTINCT o.id, o.address, o.created_at, o.latitude, o.longitude, o.location_accuracy, u.name AS consumer
-        FROM orders o JOIN order_items oi ON oi.order_id=o.id JOIN users u ON u.id=o.consumer_id
-        WHERE oi.farmer_id=? ORDER BY o.id DESC""", (user["id"],)).fetchall()]
-    return render_template("farmer_deliveries.html", orders=orders)
-
-@app.route("/admin")
-def admin_dashboard():
-    user = current_user()
-    if not user or user["role"] != "admin":
-        flash("Administrator access is required.", "error")
-        return redirect(url_for("index"))
-    database = db()
-    stats = {"farmers": database.execute("SELECT COUNT(*) FROM users WHERE role='farmer'").fetchone()[0], "consumers": database.execute("SELECT COUNT(*) FROM users WHERE role='consumer'").fetchone()[0], "products": database.execute("SELECT COUNT(*) FROM products").fetchone()[0], "orders": database.execute("SELECT COUNT(*) FROM orders").fetchone()[0], "revenue": database.execute("SELECT COALESCE(SUM(total), 0) FROM orders").fetchone()[0]}
-    recent_orders = [dict(row) for row in database.execute("""SELECT o.id, u.name AS customer, o.total, o.payment_method, o.created_at, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id=o.id) AS item_count FROM orders o JOIN users u ON o.consumer_id=u.id ORDER BY o.id DESC LIMIT 8""").fetchall()]
-    recent_products = [dict(row) for row in database.execute("""SELECT p.name, p.price, p.unit, COALESCE(u.name, 'Smart Agri Partner Farm') AS farmer FROM products p LEFT JOIN users u ON p.farmer_id=u.id ORDER BY p.id DESC LIMIT 6""").fetchall()]
-    return render_template("admin_dashboard.html", user=user, stats=stats, recent_orders=recent_orders, recent_products=recent_products)
-
-@app.cli.command("create-admin")
-@click.option("--name", prompt="Administrator name")
-@click.option("--email", prompt="Administrator email")
-def create_admin(name, email):
-    """Create a protected administrator account."""
-    password = click.prompt("Administrator password", hide_input=True, confirmation_prompt=True)
-    try:
-        db().execute("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, 'admin')", (name.strip(), email.lower().strip(), generate_password_hash(password)))
-        db().commit()
-        click.echo("Administrator account created. Log in at /login/admin.")
-    except sqlite3.IntegrityError:
-        click.echo("That email address already has an account.", err=True)
-
-@app.route("/products/add", methods=["POST"])
-def add_product():
-    user = current_user()
-    if not user or user["role"] != "farmer": return redirect(url_for("index"))
-    try:
-        price = float(request.form["price"])
-        if not (0 < price <= 100000): raise ValueError
-    except ValueError:
-        flash("Enter a valid price.", "error"); return redirect(url_for("dashboard"))
-    name, unit = request.form["name"].strip(), request.form["unit"].strip() or "item"
-    if not name or len(name) > 120 or len(unit) > 30:
-        flash("Enter a valid product name and unit.", "error"); return redirect(url_for("dashboard"))
-    image_name = None; image = request.files.get("image")
-    if image and image.filename:
-        suffix = Path(secure_filename(image.filename)).suffix.lower()
-        signature = image.stream.read(16); image.stream.seek(0)
-        valid_image = ((suffix in {".jpg", ".jpeg"} and signature.startswith(b"\xff\xd8\xff"))
-                       or (suffix == ".png" and signature.startswith(b"\x89PNG\r\n\x1a\n"))
-                       or (suffix == ".webp" and signature.startswith(b"RIFF") and signature[8:12] == b"WEBP"))
-        if not valid_image:
-            flash("Use a JPG, PNG, or WEBP image.", "error"); return redirect(url_for("dashboard"))
-        image_name = f"{datetime.now():%Y%m%d%H%M%S%f}{suffix}"; image.save(app.config["UPLOAD_FOLDER"] / image_name)
-    db().execute("INSERT INTO products (name, price, unit, image, farmer_id) VALUES (?, ?, ?, ?, ?)", (name, price, unit, image_name, user["id"]))
-    db().commit(); flash("Your product is now live in the marketplace.", "success")
-    return redirect(url_for("dashboard"))
-
-@app.route("/cart/add/<int:product_id>", methods=["POST"])
-def add_to_cart(product_id):
-    user = current_user()
-    if not user or user["role"] != "consumer": return redirect(url_for("login", role="consumer"))
-    if db().execute("SELECT 1 FROM products WHERE id = ?", (product_id,)).fetchone():
-        db().execute("INSERT INTO cart_items (consumer_id, product_id, quantity) VALUES (?, ?, 1) ON CONFLICT(consumer_id, product_id) DO UPDATE SET quantity = quantity + 1", (user["id"], product_id)); db().commit()
-        flash("Added to your basket.", "success")
-    return redirect(url_for("dashboard"))
-
-def get_cart(consumer_id):
-    rows = db().execute("""SELECT p.id, p.name, p.price, p.unit, p.image, p.emoji, p.farmer_id, ci.quantity,
-        COALESCE(u.name, 'Smart Agri Partner Farm') AS farm FROM cart_items ci JOIN products p ON ci.product_id = p.id
-        LEFT JOIN users u ON p.farmer_id = u.id WHERE ci.consumer_id = ?""", (consumer_id,)).fetchall()
-    return [{**dict(row), "total": row["price"] * row["quantity"]} for row in rows]
-
-@app.route("/checkout", methods=["GET", "POST"])
-def checkout():
-    user = current_user()
-    if not user or user["role"] != "consumer": return redirect(url_for("login", role="consumer"))
-    items = get_cart(user["id"])
-    if not items: flash("Your basket is empty.", "error"); return redirect(url_for("dashboard"))
-    total = sum(item["total"] for item in items)
-    if request.method == "POST":
-        if total < MINIMUM_ORDER_AMOUNT:
-            flash(f"The minimum order amount is ₹{MINIMUM_ORDER_AMOUNT:.0f}. Add ₹{MINIMUM_ORDER_AMOUNT - total:.2f} more to continue.", "error")
-            return redirect(url_for("checkout"))
-        address, payment = request.form["address"].strip(), request.form.get("payment")
-        try:
-            latitude = float(request.form["latitude"]) if request.form.get("latitude") else None
-            longitude = float(request.form["longitude"]) if request.form.get("longitude") else None
-            accuracy = float(request.form["location_accuracy"]) if request.form.get("location_accuracy") else None
-            if latitude is not None and not (-90 <= latitude <= 90 and -180 <= longitude <= 180): raise ValueError
-        except (ValueError, TypeError):
-            latitude = longitude = accuracy = None
-        if not address or len(address) > 500 or payment not in {"UPI", "Card", "Cash on delivery"}: flash("Enter a valid delivery address and choose payment.", "error")
-        else:
-            now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-            cursor = db().execute("INSERT INTO orders (consumer_id, address, payment_method, total, created_at, latitude, longitude, location_accuracy) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (user["id"], address, payment, total, now, latitude, longitude, accuracy))
-            order_id = cursor.lastrowid
-            db().executemany("INSERT INTO order_items (order_id, product_name, farm_name, price, unit, quantity, subtotal, farmer_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [(order_id, i["name"], i["farm"], i["price"], i["unit"], i["quantity"], i["total"], i["farmer_id"]) for i in items])
-            db().execute("DELETE FROM cart_items WHERE consumer_id = ?", (user["id"],)); db().commit()
-            order = {"id": order_id, "buyer": user["name"], "address": address, "payment": payment, "items": items, "total": total, "date": now}
-            return render_template("order_success.html", order=order)
-    return render_template("checkout.html", items=items, total=total, minimum_order_amount=MINIMUM_ORDER_AMOUNT)
-
-@app.route("/invoice/<int:order_id>.pdf")
-def invoice(order_id):
-    user = current_user()
-    order = db().execute("SELECT * FROM orders WHERE id = ? AND consumer_id = ?", (order_id, user["id"] if user else -1)).fetchone()
-    if not order: return redirect(url_for("index"))
-    items = db().execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,)).fetchall()
-    lines = ["SMART AGRI - ORDER INVOICE", "", f"Invoice no: SA-{order_id}", f"Date: {order['created_at']}", f"Delivery: {order['address']}", f"Payment: {order['payment_method']}", "", "ITEMS"]
-    lines += [f"{i['product_name']} x {i['quantity']} @ Rs. {i['price']:.2f} = Rs. {i['subtotal']:.2f}" for i in items]
-    lines += ["", f"TOTAL PAID: Rs. {order['total']:.2f}", "", "Thank you for supporting local farmers."]
-    content = "BT\n/F1 12 Tf\n50 760 Td\n" + "\n".join(f"({line.replace('(', '[').replace(')', ']')}) Tj 0 -18 Td" for line in lines) + "\nET"
-    objects = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", f"<< /Length {len(content.encode())} >>\nstream\n{content}\nendstream"]
-    pdf, offsets = "%PDF-1.4\n", []
-    for n, obj in enumerate(objects, 1): offsets.append(len(pdf.encode())); pdf += f"{n} 0 obj\n{obj}\nendobj\n"
-    start = len(pdf.encode()); pdf += f"xref\n0 6\n0000000000 65535 f \n" + "".join(f"{x:010d} 00000 n \n" for x in offsets) + f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start}\n%%EOF"
-    return send_file(BytesIO(pdf.encode()), mimetype="application/pdf", as_attachment=True, download_name=f"smart-agri-invoice-{order_id}.pdf")
-
-def recommend_crops(nitrogen, phosphorus, potassium, ph, temperature, rainfall):
-    crops = [("Rice",75,45,45,6.2,28,180,"Warm, wet conditions with balanced soil nutrients suit paddy cultivation."),("Wheat",70,40,35,6.8,21,75,"Cooler conditions and moderate rainfall are favourable for wheat."),("Maize",80,50,45,6.3,25,100,"Maize performs well in warm weather with balanced NPK levels."),("Cotton",85,40,45,7.2,29,65,"Warm, relatively dry conditions are a strong fit for cotton."),("Chickpea",25,45,35,7.3,22,55,"Lower nitrogen and drier conditions support this nitrogen-fixing pulse."),("Sugarcane",95,55,55,6.5,28,150,"High nutrients, warmth, and reliable moisture favour sugarcane.")]
-    ranked=[]
-    for name,n,p,k,ideal_ph,temp,rain,reason in crops:
-        score=max(45,round(100-(abs(nitrogen-n)/45+abs(phosphorus-p)/35+abs(potassium-k)/35+abs(ph-ideal_ph)/1.4+abs(temperature-temp)/12+abs(rainfall-rain)/110)*9)); ranked.append({"name":name,"score":score,"reason":reason})
-    return sorted(ranked,key=lambda crop:crop["score"],reverse=True)[:3]
-
-def fertilizer_plan(crop):
-    """Create a baseline per-acre plan when only the crop is known.
-
-    Soil-test results are deliberately not guessed.  Farmers can use this as a
-    starting guide and should adjust it with a local soil-health recommendation.
+    :param import_name: the name of the application package
+    :param static_url_path: can be used to specify a different path for the
+                            static files on the web.  Defaults to the name
+                            of the `static_folder` folder.
+    :param static_folder: The folder with static files that is served at
+        ``static_url_path``. Relative to the application ``root_path``
+        or an absolute path. Defaults to ``'static'``.
+    :param static_host: the host to use when adding the static route.
+        Defaults to None. Required when using ``host_matching=True``
+        with a ``static_folder`` configured.
+    :param host_matching: set ``url_map.host_matching`` attribute.
+        Defaults to False.
+    :param subdomain_matching: consider the subdomain relative to
+        :data:`SERVER_NAME` when matching routes. Defaults to False.
+    :param template_folder: the folder that contains the templates that should
+                            be used by the application.  Defaults to
+                            ``'templates'`` folder in the root path of the
+                            application.
+    :param instance_path: An alternative instance path for the application.
+                          By default the folder ``'instance'`` next to the
+                          package or module is assumed to be the instance
+                          path.
+    :param instance_relative_config: if set to ``True`` relative filenames
+                                     for loading the config are assumed to
+                                     be relative to the instance path instead
+                                     of the application root.
+    :param root_path: The path to the root of the application files.
+        This should only be set manually when it can't be detected
+        automatically, such as for namespace packages.
     """
-    targets = {"Rice": (50, 25, 25), "Wheat": (45, 23, 18), "Maize": (60, 30, 25), "Cotton": (48, 24, 24), "Sugarcane": (80, 35, 35), "Vegetables": (55, 28, 30)}
-    target_n, target_p, target_k = targets[crop]
-    products = [
-        ("Urea (46% N)", target_n / .46, "Split into 2–3 applications; avoid applying before heavy rain."),
-        ("DAP (18-46-0)", target_p / .46, "Apply mainly as a basal dose during sowing or transplanting."),
-        ("MOP (0-0-60)", target_k / .60, "Apply as a basal dose or split according to crop stage."),
-    ]
-    return [{"name": name, "amount": round(amount, 1), "timing": timing} for name, amount, timing in products]
 
-@app.route("/fertilizer-guide")
-def fertilizer_guide():
-    user = current_user()
-    if not user or user["role"] != "farmer": return redirect(url_for("login", role="farmer"))
-    crops = ("Rice", "Wheat", "Maize", "Cotton", "Sugarcane", "Vegetables")
-    crop = request.args.get("crop", "Rice")
-    if crop not in crops: crop = "Rice"
-    return render_template("fertilizer_guide.html", plan=fertilizer_plan(crop), crop=crop, crops=crops)
+    default_config = ImmutableDict(
+        {
+            "DEBUG": None,
+            "TESTING": False,
+            "PROPAGATE_EXCEPTIONS": None,
+            "SECRET_KEY": None,
+            "SECRET_KEY_FALLBACKS": None,
+            "PERMANENT_SESSION_LIFETIME": timedelta(days=31),
+            "USE_X_SENDFILE": False,
+            "TRUSTED_HOSTS": None,
+            "SERVER_NAME": None,
+            "APPLICATION_ROOT": "/",
+            "SESSION_COOKIE_NAME": "session",
+            "SESSION_COOKIE_DOMAIN": None,
+            "SESSION_COOKIE_PATH": None,
+            "SESSION_COOKIE_HTTPONLY": True,
+            "SESSION_COOKIE_SECURE": False,
+            "SESSION_COOKIE_PARTITIONED": False,
+            "SESSION_COOKIE_SAMESITE": None,
+            "SESSION_REFRESH_EACH_REQUEST": True,
+            "MAX_CONTENT_LENGTH": None,
+            "MAX_FORM_MEMORY_SIZE": 500_000,
+            "MAX_FORM_PARTS": 1_000,
+            "SEND_FILE_MAX_AGE_DEFAULT": None,
+            "TRAP_BAD_REQUEST_ERRORS": None,
+            "TRAP_HTTP_EXCEPTIONS": False,
+            "EXPLAIN_TEMPLATE_LOADING": False,
+            "PREFERRED_URL_SCHEME": "http",
+            "TEMPLATES_AUTO_RELOAD": None,
+            "MAX_COOKIE_SIZE": 4093,
+            "PROVIDE_AUTOMATIC_OPTIONS": True,
+        }
+    )
 
-@app.route("/api/fertilizer-guide/<crop>")
-def fertilizer_guide_api(crop):
-    user = current_user()
-    if not user or user["role"] != "farmer":
-        return jsonify({"error": "Farmer sign-in is required."}), 401
-    crops = {"Rice", "Wheat", "Maize", "Cotton", "Sugarcane", "Vegetables"}
-    if crop not in crops:
-        return jsonify({"error": "Crop not supported."}), 404
-    return jsonify({"crop": crop, "plan": fertilizer_plan(crop)})
+    #: The class that is used for request objects.  See :class:`~flask.Request`
+    #: for more information.
+    request_class: type[Request] = Request
 
-@app.route("/government-schemes")
-def government_schemes():
-    user = current_user()
-    if not user or user["role"] != "farmer": return redirect(url_for("login", role="farmer"))
-    schemes = [
-        {"name": "PM-KISAN Samman Nidhi", "icon": "₹", "summary": "Income-support scheme for eligible landholding farmer families. Registration, status, and eKYC are available on the official portal.", "link": "https://pmkisan.gov.in/", "action": "Check eligibility / register"},
-        {"name": "Soil Health Card", "icon": "◒", "summary": "Get soil nutrient status and fertilizer or soil-amendment advice based on your holding’s soil test.", "link": "https://soilhealth.dac.gov.in/", "action": "Visit Soil Health portal"},
-        {"name": "e-NAM", "icon": "↗", "summary": "National Agriculture Market connects participating mandis for transparent price discovery, wider market access, and digital trade.", "link": "https://enam.gov.in/web/stakeholders-Involved/farmers", "action": "Explore farmer registration"},
-        {"name": "Kisan Credit Card", "icon": "□", "summary": "Access the official PM-KISAN portal for KCC form and scheme-related farmer resources. Verify local bank eligibility before applying.", "link": "https://pmkisan.gov.in/", "action": "Open official resources"},
-    ]
-    return render_template("government_schemes.html", schemes=schemes)
+    #: The class that is used for response objects.  See
+    #: :class:`~flask.Response` for more information.
+    response_class: type[Response] = Response
 
-@app.route("/crop-recommendation", methods=["GET", "POST"])
-def crop_recommendation():
-    user = current_user()
-    if not user or user["role"] != "farmer": return redirect(url_for("login", role="farmer"))
-    recommendations, values = None, {}
-    if request.method == "POST":
+    #: the session interface to use.  By default an instance of
+    #: :class:`~flask.sessions.SecureCookieSessionInterface` is used here.
+    #:
+    #: .. versionadded:: 0.8
+    session_interface: SessionInterface = SecureCookieSessionInterface()
+
+    def __init__(
+        self,
+        import_name: str,
+        static_url_path: str | None = None,
+        static_folder: str | os.PathLike[str] | None = "static",
+        static_host: str | None = None,
+        host_matching: bool = False,
+        subdomain_matching: bool = False,
+        template_folder: str | os.PathLike[str] | None = "templates",
+        instance_path: str | None = None,
+        instance_relative_config: bool = False,
+        root_path: str | None = None,
+    ):
+        super().__init__(
+            import_name=import_name,
+            static_url_path=static_url_path,
+            static_folder=static_folder,
+            static_host=static_host,
+            host_matching=host_matching,
+            subdomain_matching=subdomain_matching,
+            template_folder=template_folder,
+            instance_path=instance_path,
+            instance_relative_config=instance_relative_config,
+            root_path=root_path,
+        )
+
+        #: The Click command group for registering CLI commands for this
+        #: object. The commands are available from the ``flask`` command
+        #: once the application has been discovered and blueprints have
+        #: been registered.
+        self.cli = cli.AppGroup()
+
+        # Set the name of the Click group in case someone wants to add
+        # the app's commands to another CLI tool.
+        self.cli.name = self.name
+
+        # Add a static route using the provided static_url_path, static_host,
+        # and static_folder if there is a configured static_folder.
+        # Note we do this without checking if static_folder exists.
+        # For one, it might be created while the server is running (e.g. during
+        # development). Also, Google App Engine stores static files somewhere
+        if self.has_static_folder:
+            assert bool(static_host) == host_matching, (
+                "Invalid static_host/host_matching combination"
+            )
+            # Use a weakref to avoid creating a reference cycle between the app
+            # and the view function (see #3761).
+            self_ref = weakref.ref(self)
+            self.add_url_rule(
+                f"{self.static_url_path}/<path:filename>",
+                endpoint="static",
+                host=static_host,
+                view_func=lambda **kw: self_ref().send_static_file(**kw),  # type: ignore
+            )
+
+    def get_send_file_max_age(self, filename: str | None) -> int | None:
+        """Used by :func:`send_file` to determine the ``max_age`` cache
+        value for a given file path if it wasn't passed.
+
+        By default, this returns :data:`SEND_FILE_MAX_AGE_DEFAULT` from
+        the configuration of :data:`~flask.current_app`. This defaults
+        to ``None``, which tells the browser to use conditional requests
+        instead of a timed cache, which is usually preferable.
+
+        Note this is a duplicate of the same method in the Flask
+        class.
+
+        .. versionchanged:: 2.0
+            The default configuration is ``None`` instead of 12 hours.
+
+        .. versionadded:: 0.9
+        """
+        value = current_app.config["SEND_FILE_MAX_AGE_DEFAULT"]
+
+        if value is None:
+            return None
+
+        if isinstance(value, timedelta):
+            return int(value.total_seconds())
+
+        return value  # type: ignore[no-any-return]
+
+    def send_static_file(self, filename: str) -> Response:
+        """The view function used to serve files from
+        :attr:`static_folder`. A route is automatically registered for
+        this view at :attr:`static_url_path` if :attr:`static_folder` is
+        set.
+
+        Note this is a duplicate of the same method in the Flask
+        class.
+
+        .. versionadded:: 0.5
+
+        """
+        if not self.has_static_folder:
+            raise RuntimeError("'static_folder' must be set to serve static_files.")
+
+        # send_file only knows to call get_send_file_max_age on the app,
+        # call it here so it works for blueprints too.
+        max_age = self.get_send_file_max_age(filename)
+        return send_from_directory(
+            t.cast(str, self.static_folder), filename, max_age=max_age
+        )
+
+    def open_resource(
+        self, resource: str, mode: str = "rb", encoding: str | None = None
+    ) -> t.IO[t.AnyStr]:
+        """Open a resource file relative to :attr:`root_path` for reading.
+
+        For example, if the file ``schema.sql`` is next to the file
+        ``app.py`` where the ``Flask`` app is defined, it can be opened
+        with:
+
+        .. code-block:: python
+
+            with app.open_resource("schema.sql") as f:
+                conn.executescript(f.read())
+
+        :param resource: Path to the resource relative to :attr:`root_path`.
+        :param mode: Open the file in this mode. Only reading is supported,
+            valid values are ``"r"`` (or ``"rt"``) and ``"rb"``.
+        :param encoding: Open the file with this encoding when opening in text
+            mode. This is ignored when opening in binary mode.
+
+        .. versionchanged:: 3.1
+            Added the ``encoding`` parameter.
+        """
+        if mode not in {"r", "rt", "rb"}:
+            raise ValueError("Resources can only be opened for reading.")
+
+        path = os.path.join(self.root_path, resource)
+
+        if mode == "rb":
+            return open(path, mode)  # pyright: ignore
+
+        return open(path, mode, encoding=encoding)
+
+    def open_instance_resource(
+        self, resource: str, mode: str = "rb", encoding: str | None = "utf-8"
+    ) -> t.IO[t.AnyStr]:
+        """Open a resource file relative to the application's instance folder
+        :attr:`instance_path`. Unlike :meth:`open_resource`, files in the
+        instance folder can be opened for writing.
+
+        :param resource: Path to the resource relative to :attr:`instance_path`.
+        :param mode: Open the file in this mode.
+        :param encoding: Open the file with this encoding when opening in text
+            mode. This is ignored when opening in binary mode.
+
+        .. versionchanged:: 3.1
+            Added the ``encoding`` parameter.
+        """
+        path = os.path.join(self.instance_path, resource)
+
+        if "b" in mode:
+            return open(path, mode)
+
+        return open(path, mode, encoding=encoding)
+
+    def create_jinja_environment(self) -> Environment:
+        """Create the Jinja environment based on :attr:`jinja_options`
+        and the various Jinja-related methods of the app. Changing
+        :attr:`jinja_options` after this will have no effect. Also adds
+        Flask-related globals and filters to the environment.
+
+        .. versionchanged:: 0.11
+           ``Environment.auto_reload`` set in accordance with
+           ``TEMPLATES_AUTO_RELOAD`` configuration option.
+
+        .. versionadded:: 0.5
+        """
+        options = dict(self.jinja_options)
+
+        if "autoescape" not in options:
+            options["autoescape"] = self.select_jinja_autoescape
+
+        if "auto_reload" not in options:
+            auto_reload = self.config["TEMPLATES_AUTO_RELOAD"]
+
+            if auto_reload is None:
+                auto_reload = self.debug
+
+            options["auto_reload"] = auto_reload
+
+        rv = self.jinja_environment(self, **options)
+        rv.globals.update(
+            url_for=self.url_for,
+            get_flashed_messages=get_flashed_messages,
+            config=self.config,
+            # request, session and g are normally added with the
+            # context processor for efficiency reasons but for imported
+            # templates we also want the proxies in there.
+            request=request,
+            session=session,
+            g=g,
+        )
+        rv.policies["json.dumps_function"] = self.json.dumps
+        return rv
+
+    def create_url_adapter(self, request: Request | None) -> MapAdapter | None:
+        """Creates a URL adapter for the given request. The URL adapter
+        is created at a point where the request context is not yet set
+        up so the request is passed explicitly.
+
+        .. versionchanged:: 3.1
+            If :data:`SERVER_NAME` is set, it does not restrict requests to
+            only that domain, for both ``subdomain_matching`` and
+            ``host_matching``.
+
+        .. versionchanged:: 1.0
+            :data:`SERVER_NAME` no longer implicitly enables subdomain
+            matching. Use :attr:`subdomain_matching` instead.
+
+        .. versionchanged:: 0.9
+           This can be called outside a request when the URL adapter is created
+           for an application context.
+
+        .. versionadded:: 0.6
+        """
+        if request is not None:
+            if (trusted_hosts := self.config["TRUSTED_HOSTS"]) is not None:
+                request.trusted_hosts = trusted_hosts
+
+            # Check trusted_hosts here until bind_to_environ does.
+            request.host = get_host(request.environ, request.trusted_hosts)  # pyright: ignore
+            subdomain = None
+            server_name = self.config["SERVER_NAME"]
+
+            if self.url_map.host_matching:
+                # Don't pass SERVER_NAME, otherwise it's used and the actual
+                # host is ignored, which breaks host matching.
+                server_name = None
+            elif not self.subdomain_matching:
+                # Werkzeug doesn't implement subdomain matching yet. Until then,
+                # disable it by forcing the current subdomain to the default, or
+                # the empty string.
+                subdomain = self.url_map.default_subdomain or ""
+
+            return self.url_map.bind_to_environ(
+                request.environ, server_name=server_name, subdomain=subdomain
+            )
+
+        # Need at least SERVER_NAME to match/build outside a request.
+        if self.config["SERVER_NAME"] is not None:
+            return self.url_map.bind(
+                self.config["SERVER_NAME"],
+                script_name=self.config["APPLICATION_ROOT"],
+                url_scheme=self.config["PREFERRED_URL_SCHEME"],
+            )
+
+        return None
+
+    def raise_routing_exception(self, request: Request) -> t.NoReturn:
+        """Intercept routing exceptions and possibly do something else.
+
+        In debug mode, intercept a routing redirect and replace it with
+        an error if the body will be discarded.
+
+        With modern Werkzeug this shouldn't occur, since it now uses a
+        308 status which tells the browser to resend the method and
+        body.
+
+        .. versionchanged:: 2.1
+            Don't intercept 307 and 308 redirects.
+
+        :meta private:
+        :internal:
+        """
+        if (
+            not self.debug
+            or not isinstance(request.routing_exception, RequestRedirect)
+            or request.routing_exception.code in {307, 308}
+            or request.method in {"GET", "HEAD", "OPTIONS"}
+        ):
+            raise request.routing_exception  # type: ignore[misc]
+
+        from .debughelpers import FormDataRoutingRedirect
+
+        raise FormDataRoutingRedirect(request)
+
+    def update_template_context(self, context: dict[str, t.Any]) -> None:
+        """Update the template context with some commonly used variables.
+        This injects request, session, config and g into the template
+        context as well as everything template context processors want
+        to inject.  Note that the as of Flask 0.6, the original values
+        in the context will not be overridden if a context processor
+        decides to return a value with the same key.
+
+        :param context: the context as a dictionary that is updated in place
+                        to add extra variables.
+        """
+        names: t.Iterable[str | None] = (None,)
+
+        # A template may be rendered outside a request context.
+        if request:
+            names = chain(names, reversed(request.blueprints))
+
+        # The values passed to render_template take precedence. Keep a
+        # copy to re-apply after all context functions.
+        orig_ctx = context.copy()
+
+        for name in names:
+            if name in self.template_context_processors:
+                for func in self.template_context_processors[name]:
+                    context.update(self.ensure_sync(func)())
+
+        context.update(orig_ctx)
+
+    def make_shell_context(self) -> dict[str, t.Any]:
+        """Returns the shell context for an interactive shell for this
+        application.  This runs all the registered shell context
+        processors.
+
+        .. versionadded:: 0.11
+        """
+        rv = {"app": self, "g": g}
+        for processor in self.shell_context_processors:
+            rv.update(processor())
+        return rv
+
+    def run(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        debug: bool | None = None,
+        load_dotenv: bool = True,
+        **options: t.Any,
+    ) -> None:
+        """Runs the application on a local development server.
+
+        Do not use ``run()`` in a production setting. It is not intended to
+        meet security and performance requirements for a production server.
+        Instead, see :doc:`/deploying/index` for WSGI server recommendations.
+
+        If the :attr:`debug` flag is set the server will automatically reload
+        for code changes and show a debugger in case an exception happened.
+
+        If you want to run the application in debug mode, but disable the
+        code execution on the interactive debugger, you can pass
+        ``use_evalex=False`` as parameter.  This will keep the debugger's
+        traceback screen active, but disable code execution.
+
+        It is not recommended to use this function for development with
+        automatic reloading as this is badly supported.  Instead you should
+        be using the :command:`flask` command line script's ``run`` support.
+
+        .. admonition:: Keep in Mind
+
+           Flask will suppress any server error with a generic error page
+           unless it is in debug mode.  As such to enable just the
+           interactive debugger without the code reloading, you have to
+           invoke :meth:`run` with ``debug=True`` and ``use_reloader=False``.
+           Setting ``use_debugger`` to ``True`` without being in debug mode
+           won't catch any exceptions because there won't be any to
+           catch.
+
+        :param host: the hostname to listen on. Set this to ``'0.0.0.0'`` to
+            have the server available externally as well. Defaults to
+            ``'127.0.0.1'`` or the host in the ``SERVER_NAME`` config variable
+            if present.
+        :param port: the port of the webserver. Defaults to ``5000`` or the
+            port defined in the ``SERVER_NAME`` config variable if present.
+        :param debug: if given, enable or disable debug mode. See
+            :attr:`debug`.
+        :param load_dotenv: Load the nearest :file:`.env` and :file:`.flaskenv`
+            files to set environment variables. Will also change the working
+            directory to the directory containing the first file found.
+        :param options: the options to be forwarded to the underlying Werkzeug
+            server. See :func:`werkzeug.serving.run_simple` for more
+            information.
+
+        .. versionchanged:: 1.0
+            If installed, python-dotenv will be used to load environment
+            variables from :file:`.env` and :file:`.flaskenv` files.
+
+            The :envvar:`FLASK_DEBUG` environment variable will override :attr:`debug`.
+
+            Threaded mode is enabled by default.
+
+        .. versionchanged:: 0.10
+            The default port is now picked from the ``SERVER_NAME``
+            variable.
+        """
+        # Ignore this call so that it doesn't start another server if
+        # the 'flask run' command is used.
+        if os.environ.get("FLASK_RUN_FROM_CLI") == "true":
+            if not is_running_from_reloader():
+                click.secho(
+                    " * Ignoring a call to 'app.run()' that would block"
+                    " the current 'flask' CLI command.\n"
+                    "   Only call 'app.run()' in an 'if __name__ =="
+                    ' "__main__"\' guard.',
+                    fg="red",
+                )
+
+            return
+
+        if get_load_dotenv(load_dotenv):
+            cli.load_dotenv()
+
+            # if set, env var overrides existing value
+            if "FLASK_DEBUG" in os.environ:
+                self.debug = get_debug_flag()
+
+        # debug passed to method overrides all other sources
+        if debug is not None:
+            self.debug = bool(debug)
+
+        server_name = self.config.get("SERVER_NAME")
+        sn_host = sn_port = None
+
+        if server_name:
+            sn_host, _, sn_port = server_name.partition(":")
+
+        if not host:
+            if sn_host:
+                host = sn_host
+            else:
+                host = "127.0.0.1"
+
+        if port or port == 0:
+            port = int(port)
+        elif sn_port:
+            port = int(sn_port)
+        else:
+            port = 5000
+
+        options.setdefault("use_reloader", self.debug)
+        options.setdefault("use_debugger", self.debug)
+        options.setdefault("threaded", True)
+
+        cli.show_server_banner(self.debug, self.name)
+
+        from werkzeug.serving import run_simple
+
         try:
-            values={key:float(request.form[key]) for key in ("nitrogen","phosphorus","potassium","ph","temperature","rainfall")}; recommendations=recommend_crops(**values)
-        except (KeyError, ValueError): flash("Please enter valid numeric values for all soil parameters.", "error")
-    return render_template("crop_recommendation.html", recommendations=recommendations, values=values)
+            run_simple(t.cast(str, host), port, self, **options)
+        finally:
+            # reset the first request information if the development server
+            # reset normally.  This makes it possible to restart the server
+            # without reloader and that stuff from an interactive shell.
+            self._got_first_request = False
 
-@app.route("/logout")
-def logout(): session.clear(); return redirect(url_for("index"))
+    def test_client(self, use_cookies: bool = True, **kwargs: t.Any) -> FlaskClient:
+        """Creates a test client for this application.  For information
+        about unit testing head over to :doc:`/testing`.
 
-with app.app_context(): init_db()
-if __name__ == "__main__": app.run(host="0.0.0.0", port=8080, debug=False)
+        Note that if you are testing for assertions or exceptions in your
+        application code, you must set ``app.testing = True`` in order for the
+        exceptions to propagate to the test client.  Otherwise, the exception
+        will be handled by the application (not visible to the test client) and
+        the only indication of an AssertionError or other exception will be a
+        500 status code response to the test client.  See the :attr:`testing`
+        attribute.  For example::
+
+            app.testing = True
+            client = app.test_client()
+
+        The test client can be used in a ``with`` block to defer the closing down
+        of the context until the end of the ``with`` block.  This is useful if
+        you want to access the context locals for testing::
+
+            with app.test_client() as c:
+                rv = c.get('/?vodka=42')
+                assert request.args['vodka'] == '42'
+
+        Additionally, you may pass optional keyword arguments that will then
+        be passed to the application's :attr:`test_client_class` constructor.
+        For example::
+
+            from flask.testing import FlaskClient
+
+            class CustomClient(FlaskClient):
+                def __init__(self, *args, **kwargs):
+                    self._authentication = kwargs.pop("authentication")
+                    super(CustomClient,self).__init__( *args, **kwargs)
+
+            app.test_client_class = CustomClient
+            client = app.test_client(authentication='Basic ....')
+
+        See :class:`~flask.testing.FlaskClient` for more information.
+
+        .. versionchanged:: 0.4
+           added support for ``with`` block usage for the client.
+
+        .. versionadded:: 0.7
+           The `use_cookies` parameter was added as well as the ability
+           to override the client to be used by setting the
+           :attr:`test_client_class` attribute.
+
+        .. versionchanged:: 0.11
+           Added `**kwargs` to support passing additional keyword arguments to
+           the constructor of :attr:`test_client_class`.
+        """
+        cls = self.test_client_class
+        if cls is None:
+            from .testing import FlaskClient as cls
+        return cls(  # type: ignore
+            self, self.response_class, use_cookies=use_cookies, **kwargs
+        )
+
+    def test_cli_runner(self, **kwargs: t.Any) -> FlaskCliRunner:
+        """Create a CLI runner for testing CLI commands.
+        See :ref:`testing-cli`.
+
+        Returns an instance of :attr:`test_cli_runner_class`, by default
+        :class:`~flask.testing.FlaskCliRunner`. The Flask app object is
+        passed as the first argument.
+
+        .. versionadded:: 1.0
+        """
+        cls = self.test_cli_runner_class
+
+        if cls is None:
+            from .testing import FlaskCliRunner as cls
+
+        return cls(self, **kwargs)  # type: ignore
+
+    def handle_http_exception(
+        self, e: HTTPException
+    ) -> HTTPException | ft.ResponseReturnValue:
+        """Handles an HTTP exception.  By default this will invoke the
+        registered error handlers and fall back to returning the
+        exception as response.
+
+        .. versionchanged:: 1.0.3
+            ``RoutingException``, used internally for actions such as
+             slash redirects during routing, is not passed to error
+             handlers.
+
+        .. versionchanged:: 1.0
+            Exceptions are looked up by code *and* by MRO, so
+            ``HTTPException`` subclasses can be handled with a catch-all
+            handler for the base ``HTTPException``.
+
+        .. versionadded:: 0.3
+        """
+        # Proxy exceptions don't have error codes.  We want to always return
+        # those unchanged as errors
+        if e.code is None:
+            return e
+
+        # RoutingExceptions are used internally to trigger routing
+        # actions, such as slash redirects raising RequestRedirect. They
+        # are not raised or handled in user code.
+        if isinstance(e, RoutingException):
+            return e
+
+        handler = self._find_error_handler(e, request.blueprints)
+        if handler is None:
+            return e
+        return self.ensure_sync(handler)(e)  # type: ignore[no-any-return]
+
+    def handle_user_exception(
+        self, e: Exception
+    ) -> HTTPException | ft.ResponseReturnValue:
+        """This method is called whenever an exception occurs that
+        should be handled. A special case is :class:`~werkzeug
+        .exceptions.HTTPException` which is forwarded to the
+        :meth:`handle_http_exception` method. This function will either
+        return a response value or reraise the exception with the same
+        traceback.
+
+        .. versionchanged:: 1.0
+            Key errors raised from request data like ``form`` show the
+            bad key in debug mode rather than a generic bad request
+            message.
+
+        .. versionadded:: 0.7
+        """
+        if isinstance(e, BadRequestKeyError) and (
+            self.debug or self.config["TRAP_BAD_REQUEST_ERRORS"]
+        ):
+            e.show_exception = True
+
+        if isinstance(e, HTTPException) and not self.trap_http_exception(e):
+            return self.handle_http_exception(e)
+
+        handler = self._find_error_handler(e, request.blueprints)
+
+        if handler is None:
+            raise
+
+        return self.ensure_sync(handler)(e)  # type: ignore[no-any-return]
+
+    def handle_exception(self, e: Exception) -> Response:
+        """Handle an exception that did not have an error handler
+        associated with it, or that was raised from an error handler.
+        This always causes a 500 ``InternalServerError``.
+
+        Always sends the :data:`got_request_exception` signal.
+
+        If :data:`PROPAGATE_EXCEPTIONS` is ``True``, such as in debug
+        mode, the error will be re-raised so that the debugger can
+        display it. Otherwise, the original exception is logged, and
+        an :exc:`~werkzeug.exceptions.InternalServerError` is returned.
+
+        If an error handler is registered for ``InternalServerError`` or
+        ``500``, it will be used. For consistency, the handler will
+        always receive the ``InternalServerError``. The original
+        unhandled exception is available as ``e.original_exception``.
+
+        .. versionchanged:: 1.1.0
+            Always passes the ``InternalServerError`` instance to the
+            handler, setting ``original_exception`` to the unhandled
+            error.
+
+        .. versionchanged:: 1.1.0
+            ``after_request`` functions and other finalization is done
+            even for the default 500 response when there is no handler.
+
+        .. versionadded:: 0.3
+        """
+        exc_info = sys.exc_info()
+        got_request_exception.send(self, _async_wrapper=self.ensure_sync, exception=e)
+        propagate = self.config["PROPAGATE_EXCEPTIONS"]
+
+        if propagate is None:
+            propagate = self.testing or self.debug
+
+        if propagate:
+            # Re-raise if called with an active exception, otherwise
+            # raise the passed in exception.
+            if exc_info[1] is e:
+                raise
+
+            raise e
+
+        self.log_exception(exc_info)
+        server_error: InternalServerError | ft.ResponseReturnValue
+        server_error = InternalServerError(original_exception=e)
+        handler = self._find_error_handler(server_error, request.blueprints)
+
+        if handler is not None:
+            server_error = self.ensure_sync(handler)(server_error)
+
+        return self.finalize_request(server_error, from_error_handler=True)
+
+    def log_exception(
+        self,
+        exc_info: (tuple[type, BaseException, TracebackType] | tuple[None, None, None]),
+    ) -> None:
+        """Logs an exception.  This is called by :meth:`handle_exception`
+        if debugging is disabled and right before the handler is called.
+        The default implementation logs the exception as error on the
+        :attr:`logger`.
+
+        .. versionadded:: 0.8
+        """
+        self.logger.error(
+            f"Exception on {request.path} [{request.method}]", exc_info=exc_info
+        )
+
+    def dispatch_request(self) -> ft.ResponseReturnValue:
+        """Does the request dispatching.  Matches the URL and returns the
+        return value of the view or error handler.  This does not have to
+        be a response object.  In order to convert the return value to a
+        proper response object, call :func:`make_response`.
+
+        .. versionchanged:: 0.7
+           This no longer does the exception handling, this code was
+           moved to the new :meth:`full_dispatch_request`.
+        """
+        req = request_ctx.request
+        if req.routing_exception is not None:
+            self.raise_routing_exception(req)
+        rule: Rule = req.url_rule  # type: ignore[assignment]
+        # if we provide automatic options for this URL and the
+        # request came with the OPTIONS method, reply automatically
+        if (
+            getattr(rule, "provide_automatic_options", False)
+            and req.method == "OPTIONS"
+        ):
+            return self.make_default_options_response()
+        # otherwise dispatch to the handler for that endpoint
+        view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
+        return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+
+    def full_dispatch_request(self) -> Response:
+        """Dispatches the request and on top of that performs request
+        pre and postprocessing as well as HTTP exception catching and
+        error handling.
+
+        .. versionadded:: 0.7
+        """
+        self._got_first_request = True
+
+        try:
+            request_started.send(self, _async_wrapper=self.ensure_sync)
+            rv = self.preprocess_request()
+            if rv is None:
+                rv = self.dispatch_request()
+        except Exception as e:
+            rv = self.handle_user_exception(e)
+        return self.finalize_request(rv)
+
+    def finalize_request(
+        self,
+        rv: ft.ResponseReturnValue | HTTPException,
+        from_error_handler: bool = False,
+    ) -> Response:
+        """Given the return value from a view function this finalizes
+        the request by converting it into a response and invoking the
+        postprocessing functions.  This is invoked for both normal
+        request dispatching as well as error handlers.
+
+        Because this means that it might be called as a result of a
+        failure a special safe mode is available which can be enabled
+        with the `from_error_handler` flag.  If enabled, failures in
+        response processing will be logged and otherwise ignored.
+
+        :internal:
+        """
+        response = self.make_response(rv)
+        try:
+            response = self.process_response(response)
+            request_finished.send(
+                self, _async_wrapper=self.ensure_sync, response=response
+            )
+        except Exception:
+            if not from_error_handler:
+                raise
+            self.logger.exception(
+                "Request finalizing failed with an error while handling an error"
+            )
+        return response
+
+    def make_default_options_response(self) -> Response:
+        """This method is called to create the default ``OPTIONS`` response.
+        This can be changed through subclassing to change the default
+        behavior of ``OPTIONS`` responses.
+
+        .. versionadded:: 0.7
+        """
+        adapter = request_ctx.url_adapter
+        methods = adapter.allowed_methods()  # type: ignore[union-attr]
+        rv = self.response_class()
+        rv.allow.update(methods)
+        return rv
+
+    def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+        """Ensure that the function is synchronous for WSGI workers.
+        Plain ``def`` functions are returned as-is. ``async def``
+        functions are wrapped to run and wait for the response.
+
+        Override this method to change how the app runs async views.
+
+        .. versionadded:: 2.0
+        """
+        if iscoroutinefunction(func):
+            return self.async_to_sync(func)
+
+        return func
+
+    def async_to_sync(
+        self, func: t.Callable[..., t.Coroutine[t.Any, t.Any, t.Any]]
+    ) -> t.Callable[..., t.Any]:
+        """Return a sync function that will run the coroutine function.
+
+        .. code-block:: python
+
+            result = app.async_to_sync(func)(*args, **kwargs)
+
+        Override this method to change how the app converts async code
+        to be synchronously callable.
+
+        .. versionadded:: 2.0
+        """
+        try:
+            from asgiref.sync import async_to_sync as asgiref_async_to_sync
+        except ImportError:
+            raise RuntimeError(
+                "Install Flask with the 'async' extra in order to use async views."
+            ) from None
+
+        return asgiref_async_to_sync(func)
+
+    def url_for(
+        self,
+        /,
+        endpoint: str,
+        *,
+        _anchor: str | None = None,
+        _method: str | None = None,
+        _scheme: str | None = None,
+        _external: bool | None = None,
+        **values: t.Any,
+    ) -> str:
+        """Generate a URL to the given endpoint with the given values.
+
+        This is called by :func:`flask.url_for`, and can be called
+        directly as well.
+
+        An *endpoint* is the name of a URL rule, usually added with
+        :meth:`@app.route() <route>`, and usually the same name as the
+        view function. A route defined in a :class:`~flask.Blueprint`
+        will prepend the blueprint's name separated by a ``.`` to the
+        endpoint.
+
+        In some cases, such as email messages, you want URLs to include
+        the scheme and domain, like ``https://example.com/hello``. When
+        not in an active request, URLs will be external by default, but
+        this requires setting :data:`SERVER_NAME` so Flask knows what
+        domain to use. :data:`APPLICATION_ROOT` and
+        :data:`PREFERRED_URL_SCHEME` should also be configured as
+        needed. This config is only used when not in an active request.
+
+        Functions can be decorated with :meth:`url_defaults` to modify
+        keyword arguments before the URL is built.
+
+        If building fails for some reason, such as an unknown endpoint
+        or incorrect values, the app's :meth:`handle_url_build_error`
+        method is called. If that returns a string, that is returned,
+        otherwise a :exc:`~werkzeug.routing.BuildError` is raised.
+
+        :param endpoint: The endpoint name associated with the URL to
+            generate. If this starts with a ``.``, the current blueprint
+            name (if any) will be used.
+        :param _anchor: If given, append this as ``#anchor`` to the URL.
+        :param _method: If given, generate the URL associated with this
+            method for the endpoint.
+        :param _scheme: If given, the URL will have this scheme if it
+            is external.
+        :param _external: If given, prefer the URL to be internal
+            (False) or require it to be external (True). External URLs
+            include the scheme and domain. When not in an active
+            request, URLs are external by default.
+        :param values: Values to use for the variable parts of the URL
+            rule. Unknown keys are appended as query string arguments,
+            like ``?a=b&c=d``.
+
+        .. versionadded:: 2.2
+            Moved from ``flask.url_for``, which calls this method.
+        """
+        req_ctx = _cv_request.get(None)
+
+        if req_ctx is not None:
+            url_adapter = req_ctx.url_adapter
+            blueprint_name = req_ctx.request.blueprint
+
+            # If the endpoint starts with "." and the request matches a
+            # blueprint, the endpoint is relative to the blueprint.
+            if endpoint[:1] == ".":
+                if blueprint_name is not None:
+                    endpoint = f"{blueprint_name}{endpoint}"
+                else:
+                    endpoint = endpoint[1:]
+
+            # When in a request, generate a URL without scheme and
+            # domain by default, unless a scheme is given.
+            if _external is None:
+                _external = _scheme is not None
+        else:
+            app_ctx = _cv_app.get(None)
+
+            # If called by helpers.url_for, an app context is active,
+            # use its url_adapter. Otherwise, app.url_for was called
+            # directly, build an adapter.
+            if app_ctx is not None:
+                url_adapter = app_ctx.url_adapter
+            else:
+                url_adapter = self.create_url_adapter(None)
+
+            if url_adapter is None:
+                raise RuntimeError(
+                    "Unable to build URLs outside an active request"
+                    " without 'SERVER_NAME' configured. Also configure"
+                    " 'APPLICATION_ROOT' and 'PREFERRED_URL_SCHEME' as"
+                    " needed."
+                )
+
+            # When outside a request, generate a URL with scheme and
+            # domain by default.
+            if _external is None:
+                _external = True
+
+        # It is an error to set _scheme when _external=False, in order
+        # to avoid accidental insecure URLs.
+        if _scheme is not None and not _external:
+            raise ValueError("When specifying '_scheme', '_external' must be True.")
+
+        self.inject_url_defaults(endpoint, values)
+
+        try:
+            rv = url_adapter.build(  # type: ignore[union-attr]
+                endpoint,
+                values,
+                method=_method,
+                url_scheme=_scheme,
+                force_external=_external,
+            )
+        except BuildError as error:
+            values.update(
+                _anchor=_anchor, _method=_method, _scheme=_scheme, _external=_external
+            )
+            return self.handle_url_build_error(error, endpoint, values)
+
+        if _anchor is not None:
+            _anchor = _url_quote(_anchor, safe="%!#$&'()*+,/:;=?@")
+            rv = f"{rv}#{_anchor}"
+
+        return rv
+
+    def make_response(self, rv: ft.ResponseReturnValue) -> Response:
+        """Convert the return value from a view function to an instance of
+        :attr:`response_class`.
+
+        :param rv: the return value from the view function. The view function
+            must return a response. Returning ``None``, or the view ending
+            without returning, is not allowed. The following types are allowed
+            for ``view_rv``:
+
+            ``str``
+                A response object is created with the string encoded to UTF-8
+                as the body.
+
+            ``bytes``
+                A response object is created with the bytes as the body.
+
+            ``dict``
+                A dictionary that will be jsonify'd before being returned.
+
+            ``list``
+                A list that will be jsonify'd before being returned.
+
+            ``generator`` or ``iterator``
+                A generator that returns ``str`` or ``bytes`` to be
+                streamed as the response.
+
+            ``tuple``
+                Either ``(body, status, headers)``, ``(body, status)``, or
+                ``(body, headers)``, where ``body`` is any of the other types
+                allowed here, ``status`` is a string or an integer, and
+                ``headers`` is a dictionary or a list of ``(key, value)``
+                tuples. If ``body`` is a :attr:`response_class` instance,
+                ``status`` overwrites the exiting value and ``headers`` are
+                extended.
+
+            :attr:`response_class`
+                The object is returned unchanged.
+
+            other :class:`~werkzeug.wrappers.Response` class
+                The object is coerced to :attr:`response_class`.
+
+            :func:`callable`
+                The function is called as a WSGI application. The result is
+                used to create a response object.
+
+        .. versionchanged:: 2.2
+            A generator will be converted to a streaming response.
+            A list will be converted to a JSON response.
+
+        .. versionchanged:: 1.1
+            A dict will be converted to a JSON response.
+
+        .. versionchanged:: 0.9
+           Previously a tuple was interpreted as the arguments for the
+           response object.
+        """
+
+        status: int | None = None
+        headers: HeadersValue | None = None
+
+        # unpack tuple returns
+        if isinstance(rv, tuple):
+            len_rv = len(rv)
+
+            # a 3-tuple is unpacked directly
+            if len_rv == 3:
+                rv, status, headers = rv  # type: ignore[misc]
+            # decide if a 2-tuple has status or headers
+            elif len_rv == 2:
+                if isinstance(rv[1], (Headers, dict, tuple, list)):
+                    rv, headers = rv  # pyright: ignore
+                else:
+                    rv, status = rv  # type: ignore[assignment,misc]
+            # other sized tuples are not allowed
+            else:
+                raise TypeError(
+                    "The view function did not return a valid response tuple."
+                    " The tuple must have the form (body, status, headers),"
+                    " (body, status), or (body, headers)."
+                )
+
+        # the body must not be None
+        if rv is None:
+            raise TypeError(
+                f"The view function for {request.endpoint!r} did not"
+                " return a valid response. The function either returned"
+                " None or ended without a return statement."
+            )
+
+        # make sure the body is an instance of the response class
+        if not isinstance(rv, self.response_class):
+            if isinstance(rv, (str, bytes, bytearray)) or isinstance(rv, cabc.Iterator):
+                # let the response class set the status and headers instead of
+                # waiting to do it manually, so that the class can handle any
+                # special logic
+                rv = self.response_class(
+                    rv,  # pyright: ignore
+                    status=status,
+                    headers=headers,  # type: ignore[arg-type]
+                )
+                status = headers = None
+            elif isinstance(rv, (dict, list)):
+                rv = self.json.response(rv)
+            elif isinstance(rv, BaseResponse) or callable(rv):
+                # evaluate a WSGI callable, or coerce a different response
+                # class to the correct type
+                try:
+                    rv = self.response_class.force_type(
+                        rv,  # type: ignore[arg-type]
+                        request.environ,
+                    )
+                except TypeError as e:
+                    raise TypeError(
+                        f"{e}\nThe view function did not return a valid"
+                        " response. The return type must be a string,"
+                        " dict, list, tuple with headers or status,"
+                        " Response instance, or WSGI callable, but it"
+                        f" was a {type(rv).__name__}."
+                    ).with_traceback(sys.exc_info()[2]) from None
+            else:
+                raise TypeError(
+                    "The view function did not return a valid"
+                    " response. The return type must be a string,"
+                    " dict, list, tuple with headers or status,"
+                    " Response instance, or WSGI callable, but it was a"
+                    f" {type(rv).__name__}."
+                )
+
+        rv = t.cast(Response, rv)
+        # prefer the status if it was provided
+        if status is not None:
+            if isinstance(status, (str, bytes, bytearray)):
+                rv.status = status
+            else:
+                rv.status_code = status
+
+        # extend existing headers with provided headers
+        if headers:
+            rv.headers.update(headers)
+
+        return rv
+
+    def preprocess_request(self) -> ft.ResponseReturnValue | None:
+        """Called before the request is dispatched. Calls
+        :attr:`url_value_preprocessors` registered with the app and the
+        current blueprint (if any). Then calls :attr:`before_request_funcs`
+        registered with the app and the blueprint.
+
+        If any :meth:`before_request` handler returns a non-None value, the
+        value is handled as if it was the return value from the view, and
+        further request handling is stopped.
+        """
+        names = (None, *reversed(request.blueprints))
+
+        for name in names:
+            if name in self.url_value_preprocessors:
+                for url_func in self.url_value_preprocessors[name]:
+                    url_func(request.endpoint, request.view_args)
+
+        for name in names:
+            if name in self.before_request_funcs:
+                for before_func in self.before_request_funcs[name]:
+                    rv = self.ensure_sync(before_func)()
+
+                    if rv is not None:
+                        return rv  # type: ignore[no-any-return]
+
+        return None
+
+    def process_response(self, response: Response) -> Response:
+        """Can be overridden in order to modify the response object
+        before it's sent to the WSGI server.  By default this will
+        call all the :meth:`after_request` decorated functions.
+
+        .. versionchanged:: 0.5
+           As of Flask 0.5 the functions registered for after request
+           execution are called in reverse order of registration.
+
+        :param response: a :attr:`response_class` object.
+        :return: a new response object or the same, has to be an
+                 instance of :attr:`response_class`.
+        """
+        ctx = request_ctx._get_current_object()  # type: ignore[attr-defined]
+
+        for func in ctx._after_request_functions:
+            response = self.ensure_sync(func)(response)
+
+        for name in chain(request.blueprints, (None,)):
+            if name in self.after_request_funcs:
+                for func in reversed(self.after_request_funcs[name]):
+                    response = self.ensure_sync(func)(response)
+
+        if not self.session_interface.is_null_session(ctx._session):
+            self.session_interface.save_session(self, ctx._session, response)
+
+        return response
+
+    def do_teardown_request(
+        self,
+        exc: BaseException | None = _sentinel,  # type: ignore[assignment]
+    ) -> None:
+        """Called after the request is dispatched and the response is
+        returned, right before the request context is popped.
+
+        This calls all functions decorated with
+        :meth:`teardown_request`, and :meth:`Blueprint.teardown_request`
+        if a blueprint handled the request. Finally, the
+        :data:`request_tearing_down` signal is sent.
+
+        This is called by
+        :meth:`RequestContext.pop() <flask.ctx.RequestContext.pop>`,
+        which may be delayed during testing to maintain access to
+        resources.
+
+        :param exc: An unhandled exception raised while dispatching the
+            request. Detected from the current exception information if
+            not passed. Passed to each teardown function.
+
+        .. versionchanged:: 0.9
+            Added the ``exc`` argument.
+        """
+        if exc is _sentinel:
+            exc = sys.exc_info()[1]
+
+        for name in chain(request.blueprints, (None,)):
+            if name in self.teardown_request_funcs:
+                for func in reversed(self.teardown_request_funcs[name]):
+                    self.ensure_sync(func)(exc)
+
+        request_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+
+    def do_teardown_appcontext(
+        self,
+        exc: BaseException | None = _sentinel,  # type: ignore[assignment]
+    ) -> None:
+        """Called right before the application context is popped.
+
+        When handling a request, the application context is popped
+        after the request context. See :meth:`do_teardown_request`.
+
+        This calls all functions decorated with
+        :meth:`teardown_appcontext`. Then the
+        :data:`appcontext_tearing_down` signal is sent.
+
+        This is called by
+        :meth:`AppContext.pop() <flask.ctx.AppContext.pop>`.
+
+        .. versionadded:: 0.9
+        """
+        if exc is _sentinel:
+            exc = sys.exc_info()[1]
+
+        for func in reversed(self.teardown_appcontext_funcs):
+            self.ensure_sync(func)(exc)
+
+        appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+
+    def app_context(self) -> AppContext:
+        """Create an :class:`~flask.ctx.AppContext`. Use as a ``with``
+        block to push the context, which will make :data:`current_app`
+        point at this application.
+
+        An application context is automatically pushed by
+        :meth:`RequestContext.push() <flask.ctx.RequestContext.push>`
+        when handling a request, and when running a CLI command. Use
+        this to manually create a context outside of these situations.
+
+        ::
+
+            with app.app_context():
+                init_db()
+
+        See :doc:`/appcontext`.
+
+        .. versionadded:: 0.9
+        """
+        return AppContext(self)
+
+    def request_context(self, environ: WSGIEnvironment) -> RequestContext:
+        """Create a :class:`~flask.ctx.RequestContext` representing a
+        WSGI environment. Use a ``with`` block to push the context,
+        which will make :data:`request` point at this request.
+
+        See :doc:`/reqcontext`.
+
+        Typically you should not call this from your own code. A request
+        context is automatically pushed by the :meth:`wsgi_app` when
+        handling a request. Use :meth:`test_request_context` to create
+        an environment and context instead of this method.
+
+        :param environ: a WSGI environment
+        """
+        return RequestContext(self, environ)
+
+    def test_request_context(self, *args: t.Any, **kwargs: t.Any) -> RequestContext:
+        """Create a :class:`~flask.ctx.RequestContext` for a WSGI
+        environment created from the given values. This is mostly useful
+        during testing, where you may want to run a function that uses
+        request data without dispatching a full request.
+
+        See :doc:`/reqcontext`.
+
+        Use a ``with`` block to push the context, which will make
+        :data:`request` point at the request for the created
+        environment. ::
+
+            with app.test_request_context(...):
+                generate_report()
+
+        When using the shell, it may be easier to push and pop the
+        context manually to avoid indentation. ::
+
+            ctx = app.test_request_context(...)
+            ctx.push()
+            ...
+            ctx.pop()
+
+        Takes the same arguments as Werkzeug's
+        :class:`~werkzeug.test.EnvironBuilder`, with some defaults from
+        the application. See the linked Werkzeug docs for most of the
+        available arguments. Flask-specific behavior is listed here.
+
+        :param path: URL path being requested.
+        :param base_url: Base URL where the app is being served, which
+            ``path`` is relative to. If not given, built from
+            :data:`PREFERRED_URL_SCHEME`, ``subdomain``,
+            :data:`SERVER_NAME`, and :data:`APPLICATION_ROOT`.
+        :param subdomain: Subdomain name to append to
+            :data:`SERVER_NAME`.
+        :param url_scheme: Scheme to use instead of
+            :data:`PREFERRED_URL_SCHEME`.
+        :param data: The request body, either as a string or a dict of
+            form keys and values.
+        :param json: If given, this is serialized as JSON and passed as
+            ``data``. Also defaults ``content_type`` to
+            ``application/json``.
+        :param args: other positional arguments passed to
+            :class:`~werkzeug.test.EnvironBuilder`.
+        :param kwargs: other keyword arguments passed to
+            :class:`~werkzeug.test.EnvironBuilder`.
+        """
+        from .testing import EnvironBuilder
+
+        builder = EnvironBuilder(self, *args, **kwargs)
+
+        try:
+            return self.request_context(builder.get_environ())
+        finally:
+            builder.close()
+
+    def wsgi_app(
+        self, environ: WSGIEnvironment, start_response: StartResponse
+    ) -> cabc.Iterable[bytes]:
+        """The actual WSGI application. This is not implemented in
+        :meth:`__call__` so that middlewares can be applied without
+        losing a reference to the app object. Instead of doing this::
+
+            app = MyMiddleware(app)
+
+        It's a better idea to do this instead::
+
+            app.wsgi_app = MyMiddleware(app.wsgi_app)
+
+        Then you still have the original application object around and
+        can continue to call methods on it.
+
+        .. versionchanged:: 0.7
+            Teardown events for the request and app contexts are called
+            even if an unhandled error occurs. Other events may not be
+            called depending on when an error occurs during dispatch.
+            See :ref:`callbacks-and-errors`.
+
+        :param environ: A WSGI environment.
+        :param start_response: A callable accepting a status code,
+            a list of headers, and an optional exception context to
+            start the response.
+        """
+        ctx = self.request_context(environ)
+        error: BaseException | None = None
+        try:
+            try:
+                ctx.push()
+                response = self.full_dispatch_request()
+            except Exception as e:
+                error = e
+                response = self.handle_exception(e)
+            except:
+                error = sys.exc_info()[1]
+                raise
+            return response(environ, start_response)
+        finally:
+            if "werkzeug.debug.preserve_context" in environ:
+                environ["werkzeug.debug.preserve_context"](_cv_app.get())
+                environ["werkzeug.debug.preserve_context"](_cv_request.get())
+
+            if error is not None and self.should_ignore_error(error):
+                error = None
+
+            ctx.pop(error)
+
+    def __call__(
+        self, environ: WSGIEnvironment, start_response: StartResponse
+    ) -> cabc.Iterable[bytes]:
+        """The WSGI server calls the Flask application object as the
+        WSGI application. This calls :meth:`wsgi_app`, which can be
+        wrapped to apply middleware.
+        """
+        return self.wsgi_app(environ, start_response)
