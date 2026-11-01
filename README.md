@@ -63,9 +63,7 @@ The application aims to protect user information through authentication, control
 - Weather-Based Farming Alerts
 - Improved Farmer-to-Buyer Communication
 
-⚠️ Disclaimer
 
-AGRI GUIDE is developed for educational and agricultural support purposes. Agricultural recommendations should be verified with qualified agricultural professionals when necessary.
 
 👥 Team Members
 
